@@ -5,7 +5,19 @@ async function updateUserDetails(request, response) {
   try {
     const token = request.cookies.token || "";
     const user = await getUserDetailFromToken(token);
+
+    if (!user) {
+      return response.status(401).json({
+        message: "Unauthorized. Invalid or missing token",
+        error: true,
+      });
+    }
+
     const { name, profile_pic } = request.body;
+
+    if (!name) {
+      return response.status(400).json({ message: "Name is required" });
+    }
 
     await UserModel.updateOne(
       { _id: user._id },
@@ -17,7 +29,7 @@ async function updateUserDetails(request, response) {
 
     const userInformation = await UserModel.findById(user._id).select(
       "-password"
-    ); // Ẩn password
+    );
 
     return response.json({
       message: "User updated successfully",
@@ -26,7 +38,7 @@ async function updateUserDetails(request, response) {
     });
   } catch (error) {
     return response.status(500).json({
-      message: error.message || error,
+      message: error.message || "Something went wrong",
       error: true,
     });
   }

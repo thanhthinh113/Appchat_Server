@@ -6,9 +6,9 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: [true, "provide name"],
     },
-    email: {
+    phone: {
       type: String,
-      required: [true, "provide email"],
+      required: [true, "provide phone number"],
       unique: true,
     },
     password: {

@@ -4,12 +4,13 @@ const express = require("express");
 const cors = require("cors");
 const connectDB = require("./config/connectDB");
 const router = require("./routes/index");
-const checkEmail = require("./controller/checkEmail");
+const checkEmail = require("./controller/checkPhone");
 const checkPassword = require("./controller/checkPassword");
 const userDetails = require("./controller/userDetails");
 const cookiesParser = require("cookie-parser");
 const logout = require("./controller/logout");
 const updateUserDetails = require("./controller/updateUserDetails");
+const resetPassword = require("./controller/resetPassword");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -42,7 +43,7 @@ connectDB()
 // api endpoints
 app.use("/api", router);
 //check email
-router.post("/email", checkEmail);
+router.post("/phone", checkEmail);
 //check password
 router.post("/password", checkPassword);
 //login user details
@@ -51,3 +52,5 @@ router.get("/user-details", userDetails);
 router.get("/logout", logout);
 //update user
 router.post("/update-user", updateUserDetails);
+
+router.post("/reset-password", resetPassword);

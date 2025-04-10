@@ -3,24 +3,26 @@ const UserModel = require("../models/UserModel");
 
 async function registerUser(request, response) {
   try {
-    const { name, email, password, profile_pic } = request.body;
-    const checkeMail = await UserModel.findOne({ email });
-    if (checkeMail) {
+    const { name, phone, password, profile_pic } = request.body;
+    const checkPhone = await UserModel.findOne({ phone });
+
+    if (checkPhone) {
       return response.status(400).json({
-        message: "Already user exists",
+        message: "User already exists",
         error: true,
       });
     }
-    //password
+
     const salt = await bcryptjs.genSalt(10);
     const hashpassword = await bcryptjs.hash(password, salt);
 
     const payload = {
       name,
-      email,
+      phone,
       profile_pic: profile_pic || "",
       password: hashpassword,
     };
+
     const user = new UserModel(payload);
     const userSave = await user.save();
 
