@@ -3,10 +3,17 @@ const UserModel = require("../models/UserModel");
 
 async function updateUserDetails(request, response) {
   try {
-    const token = request.cookies.token || "";
+    const authHeader = request.headers.authorization;
+    const token =
+      (authHeader && authHeader.startsWith("Bearer ")
+        ? authHeader.split(" ")[1]
+        : null) ||
+      request.cookies.token ||
+      "";
+
     const user = await getUserDetailFromToken(token);
 
-    if (!user) {
+    if (!user || user.logout) {
       return response.status(401).json({
         message: "Unauthorized. Invalid or missing token",
         error: true,
