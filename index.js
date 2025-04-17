@@ -12,8 +12,9 @@ const logout = require("./controller/logout");
 const updateUserDetails = require("./controller/updateUserDetails");
 const resetPassword = require("./controller/resetPassword");
 const searchUser = require("./controller/searchUser");
+const { app, server } = require("./socket/index");
 
-const app = express();
+//const app = express();
 const PORT = process.env.PORT || 8080;
 
 // Cấu hình CORS
@@ -33,7 +34,7 @@ app.get("/", (request, response) => {
 // Kết nối MongoDB trước khi chạy server
 connectDB()
   .then(() => {
-    app.listen(PORT, () => {
+    server.listen(PORT, () => {
       console.log("server running at " + PORT);
     });
   })
