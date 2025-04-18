@@ -13,6 +13,7 @@ const updateUserDetails = require("./controller/updateUserDetails");
 const resetPassword = require("./controller/resetPassword");
 const searchUser = require("./controller/searchUser");
 const { app, server } = require("./socket/index");
+const checkPhone = require("./controller/checkPhone");
 
 //const app = express();
 const PORT = process.env.PORT || 8080;
@@ -58,3 +59,6 @@ router.post("/update-user", updateUserDetails);
 router.post("/reset-password", resetPassword);
 
 router.post("/search-user", searchUser);
+
+//check phone
+router.post("/check-phone", checkPhone);
