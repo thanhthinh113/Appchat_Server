@@ -23,6 +23,22 @@ const messageSchema = new mongoose.Schema(
       required: true,
       ref: "User",
     },
+    forwardFrom: {
+      type: mongoose.Schema.ObjectId,
+      ref: "Message",
+      default: null
+    },
+    reactions: [{
+      emoji: {
+        type: String,
+        required: true
+      },
+      userId: {
+        type: mongoose.Schema.ObjectId,
+        required: true,
+        ref: "User"
+      }
+    }]
   },
   {
     timestamps: true,

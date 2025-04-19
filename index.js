@@ -46,7 +46,7 @@ connectDB()
 // api endpoints
 app.use("/api", router);
 //check email
-router.post("/phone", checkEmail);
+router.post("/phone", checkPhone);
 //check password
 router.post("/password", checkPassword);
 //login user details
