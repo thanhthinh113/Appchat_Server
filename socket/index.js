@@ -145,6 +145,87 @@ io.on("connection", async (socket) => {
     io.to(data?.receiver).emit("conversation", conversationReceiver);
   });
 
+  // Forward message
+  socket.on("forward message", async (data) => {
+    const { messageId, sender, receiver } = data;
+
+    // Get the original message
+    const originalMessage = await MessageModel.findById(messageId);
+    if (!originalMessage) {
+      socket.emit("error", "Không tìm thấy tin nhắn");
+      return;
+    }
+
+    // Create new conversation if needed
+    let conversation = await ConversationModel.findOne({
+      $or: [
+        {
+          sender: sender,
+          receiver: receiver,
+        },
+        {
+          sender: receiver,
+          receiver: sender,
+        },
+      ],
+    });
+
+    if (!conversation) {
+      const createConversation = await ConversationModel({
+        sender: sender,
+        receiver: receiver,
+      });
+      conversation = await createConversation.save();
+    }
+
+    // Create forwarded message
+    const message = new MessageModel({
+      text: originalMessage.text,
+      imageUrl: originalMessage.imageUrl,
+      videoUrl: originalMessage.videoUrl,
+      msgByUserId: sender,
+      forwardFrom: messageId
+    });
+    const saveMessage = await message.save();
+
+    // Update conversation
+    await ConversationModel.updateOne(
+      {
+        _id: conversation?._id,
+      },
+      {
+        $push: { messages: saveMessage?._id },
+      }
+    );
+
+    // Get updated conversation
+    const getConversationMessage = await ConversationModel.findOne({
+      $or: [
+        {
+          sender: sender,
+          receiver: receiver,
+        },
+        {
+          sender: receiver,
+          receiver: sender,
+        },
+      ],
+    })
+      .populate("messages")
+      .sort({ updatedAt: -1 });
+
+    // Emit updated messages to both users
+    io.to(sender).emit("message", getConversationMessage.messages || []);
+    io.to(receiver).emit("message", getConversationMessage.messages || []);
+
+    // Update conversations list
+    const conversationSender = await getConversation(sender);
+    const conversationReceiver = await getConversation(receiver);
+
+    io.to(sender).emit("conversation", conversationSender);
+    io.to(receiver).emit("conversation", conversationReceiver);
+  });
+
   //sidebar
   socket.on("sidebar", async (currenUserId) => {
     console.log("currenUserId", currenUserId);
@@ -183,6 +264,152 @@ io.on("connection", async (socket) => {
 
     io.to(user?._id?.toString()).emit("conversation", conversationSender);
     io.to(msgByUserId).emit("conversation", conversationReceiver);
+  });
+
+  socket.on("get-contacts", async () => {
+    try {
+      const allUsers = await UserModel.find({ _id: { $ne: user._id } })
+        .select("name profile_pic")
+        .lean();
+
+      const contactsWithOnlineStatus = allUsers.map(contact => ({
+        ...contact,
+        online: onlineUser.has(contact._id.toString())
+      }));
+
+      socket.emit("contacts", contactsWithOnlineStatus);
+    } catch (error) {
+      console.error("Lỗi khi lấy danh sách liên hệ:", error);
+      socket.emit("error", "Không thể lấy danh sách liên hệ");
+    }
+  });
+
+  //handle delete message
+  socket.on("delete-message", async (data) => {
+    const { messageId, senderId, receiverId } = data;
+    console.log("Deleting message:", data);
+
+    try {
+      // Verify that the sender is the one deleting the message
+      const message = await MessageModel.findOne({
+        _id: messageId,
+        msgByUserId: senderId,
+      });
+
+      if (!message) {
+        console.log("Message not found or not authorized");
+        socket.emit("error", {
+          message: "Message not found or not authorized",
+        });
+        return;
+      }
+
+      // Delete the message
+      const deleteResult = await MessageModel.deleteOne({ _id: messageId });
+      console.log("Delete result:", deleteResult);
+
+      // Remove message reference from conversation
+      const updateResult = await ConversationModel.updateOne(
+        {
+          $or: [
+            { sender: senderId, receiver: receiverId },
+            { sender: receiverId, receiver: senderId },
+          ],
+        },
+        { $pull: { messages: messageId } }
+      );
+      console.log("Update conversation result:", updateResult);
+
+      // Get updated conversation
+      const updatedConversation = await ConversationModel.findOne({
+        $or: [
+          { sender: senderId, receiver: receiverId },
+          { sender: receiverId, receiver: senderId },
+        ],
+      }).populate({
+        path: 'messages',
+        options: { sort: { 'createdAt': -1 } }
+      });
+
+      // Send updated messages to both users
+      console.log("Sending updated messages to users");
+      io.to(senderId).emit("message", updatedConversation?.messages || []);
+      io.to(receiverId).emit("message", updatedConversation?.messages || []);
+
+      // Update conversation list for both users
+      const conversationSender = await getConversation(senderId);
+      const conversationReceiver = await getConversation(receiverId);
+
+      io.to(senderId).emit("conversation", conversationSender);
+      io.to(receiverId).emit("conversation", conversationReceiver);
+
+      // Send success response
+      socket.emit("delete-message-success", { messageId });
+    } catch (error) {
+      console.error("Error deleting message:", error);
+      socket.emit("error", { message: "Failed to delete message" });
+    }
+  });
+
+  // Handle message reactions
+  socket.on("react_to_message", async (data) => {
+    const { messageId, emoji } = data;
+
+    try {
+      const message = await MessageModel.findById(messageId);
+      if (!message) {
+        socket.emit("error", "Không tìm thấy tin nhắn");
+        return;
+      }
+
+      // Kiểm tra xem user đã reaction chưa
+      const existingReactionIndex = message.reactions.findIndex(
+        r => r.userId.toString() === user._id.toString() && r.emoji === emoji
+      );
+
+      if (existingReactionIndex > -1) {
+        // Nếu đã có reaction giống vậy thì xóa đi
+        message.reactions.splice(existingReactionIndex, 1);
+      } else {
+        // Xóa reaction cũ của user (nếu có)
+        const userReactionIndex = message.reactions.findIndex(
+          r => r.userId.toString() === user._id.toString()
+        );
+        if (userReactionIndex > -1) {
+          message.reactions.splice(userReactionIndex, 1);
+        }
+        // Thêm reaction mới
+        message.reactions.push({
+          emoji,
+          userId: user._id
+        });
+      }
+
+      await message.save();
+
+      // Lấy conversation và emit lại messages cho cả 2 bên
+      const conversation = await ConversationModel.findOne({
+        messages: messageId
+      });
+
+      if (conversation) {
+        const getConversationMessage = await ConversationModel.findById(conversation._id)
+          .populate("messages")
+          .sort({ updatedAt: -1 });
+
+        io.to(conversation.sender.toString()).emit(
+          "message",
+          getConversationMessage.messages || []
+        );
+        io.to(conversation.receiver.toString()).emit(
+          "message",
+          getConversationMessage.messages || []
+        );
+      }
+    } catch (error) {
+      console.error("Lỗi khi xử lý reaction:", error);
+      socket.emit("error", "Không thể thêm reaction");
+    }
   });
 
   //dissconnect
