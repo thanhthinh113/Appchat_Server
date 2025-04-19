@@ -104,6 +104,8 @@ io.on("connection", async (socket) => {
       text: data.text,
       imageUrl: data.imageUrl,
       videoUrl: data.videoUrl,
+      fileUrl: data.fileUrl,
+      fileName: data.fileName,
       msgByUserId: data?.msgByUserId,
       createdAt: new Date(), // Explicitly set creation time
     });
