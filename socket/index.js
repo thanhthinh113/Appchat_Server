@@ -105,6 +105,7 @@ io.on("connection", async (socket) => {
       imageUrl: data.imageUrl,
       videoUrl: data.videoUrl,
       msgByUserId: data?.msgByUserId,
+      createdAt: new Date(), // Explicitly set creation time
     });
     const saveMessage = await message.save();
 
@@ -128,8 +129,10 @@ io.on("connection", async (socket) => {
         },
       ],
     })
-      .populate("messages")
-      .sort({ updatedAt: -1 });
+      .populate({
+        path: "messages",
+        options: { sort: { createdAt: 1 } } // Sort by creation time ascending
+      });
 
     io.to(data?.sender).emit("message", getConversationMessage.messages || []);
     io.to(data?.receiver).emit(
@@ -320,7 +323,7 @@ io.on("connection", async (socket) => {
       );
       console.log("Update conversation result:", updateResult);
 
-      // Get updated conversation
+      // Get updated conversation with properly sorted messages
       const updatedConversation = await ConversationModel.findOne({
         $or: [
           { sender: senderId, receiver: receiverId },
@@ -328,13 +331,16 @@ io.on("connection", async (socket) => {
         ],
       }).populate({
         path: 'messages',
-        options: { sort: { 'createdAt': -1 } }
+        options: { sort: { 'createdAt': 1 } } // Sort by creation time ascending
       });
 
+      // Make sure messages array exists and is sorted
+      const sortedMessages = updatedConversation?.messages || [];
+      
       // Send updated messages to both users
       console.log("Sending updated messages to users");
-      io.to(senderId).emit("message", updatedConversation?.messages || []);
-      io.to(receiverId).emit("message", updatedConversation?.messages || []);
+      io.to(senderId).emit("message", sortedMessages);
+      io.to(receiverId).emit("message", sortedMessages);
 
       // Update conversation list for both users
       const conversationSender = await getConversation(senderId);

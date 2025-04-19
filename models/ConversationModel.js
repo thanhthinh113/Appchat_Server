@@ -45,6 +45,9 @@ const messageSchema = new mongoose.Schema(
   }
 );
 
+// Add index for createdAt to ensure proper sorting
+messageSchema.index({ createdAt: 1 });
+
 const conversationSchema = new mongoose.Schema(
   {
     sender: {
@@ -63,11 +66,22 @@ const conversationSchema = new mongoose.Schema(
         ref: "Message",
       },
     ],
+    lastMessage: {
+      type: mongoose.Schema.ObjectId,
+      ref: "Message",
+    },
+    lastMessageTime: {
+      type: Date,
+      default: Date.now
+    }
   },
   {
     timestamps: true,
   }
 );
+
+// Add compound index for sender and receiver to optimize queries
+conversationSchema.index({ sender: 1, receiver: 1 });
 
 const MessageModel = mongoose.model("Message", messageSchema);
 const ConversationModel = mongoose.model("Conversation", conversationSchema);
