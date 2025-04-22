@@ -739,6 +739,7 @@ io.on("connection", async (socket) => {
           }
         };
 
+        // Chỉ gửi thông tin cập nhật reaction, không gửi lại toàn bộ danh sách tin nhắn
         io.to(conversation.sender.toString()).emit("reaction-updated", reactionUpdate);
         io.to(conversation.receiver.toString()).emit("reaction-updated", reactionUpdate);
       }
