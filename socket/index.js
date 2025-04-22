@@ -355,85 +355,107 @@ io.on("connection", async (socket) => {
     }
   });
 
-  // Forward message
+  // Handle forward message
   socket.on("forward message", async (data) => {
-    const { messageId, sender, receiver } = data;
+    try {
+      const { messageId, sender, receiver } = data;
 
-    // Get the original message
-    const originalMessage = await MessageModel.findById(messageId);
-    if (!originalMessage) {
-      socket.emit("error", "Không tìm thấy tin nhắn");
-      return;
-    }
-
-    // Create new conversation if needed
-    let conversation = await ConversationModel.findOne({
-      $or: [
-        {
-          sender: sender,
-          receiver: receiver,
-        },
-        {
-          sender: receiver,
-          receiver: sender,
-        },
-      ],
-    });
-
-    if (!conversation) {
-      const createConversation = await ConversationModel({
-        sender: sender,
-        receiver: receiver,
-      });
-      conversation = await createConversation.save();
-    }
-
-    // Create forwarded message
-    const message = new MessageModel({
-      text: originalMessage.text,
-      imageUrl: originalMessage.imageUrl,
-      videoUrl: originalMessage.videoUrl,
-      msgByUserId: sender,
-      forwardFrom: messageId
-    });
-    const saveMessage = await message.save();
-
-    // Update conversation
-    await ConversationModel.updateOne(
-      {
-        _id: conversation?._id,
-      },
-      {
-        $push: { messages: saveMessage?._id },
+      // Kiểm tra xem người nhận có phải là bạn bè không
+      const currentUser = await UserModel.findById(sender);
+      if (!currentUser.friends.includes(receiver)) {
+        socket.emit("error", "You can only forward messages to friends");
+        return;
       }
-    );
 
-    // Get updated conversation
-    const getConversationMessage = await ConversationModel.findOne({
-      $or: [
-        {
+      // Kiểm tra không được chuyển tiếp cho chính mình
+      if (sender === receiver) {
+        socket.emit("error", "Cannot forward message to yourself");
+        return;
+      }
+
+      // Get the original message
+      const originalMessage = await MessageModel.findById(messageId);
+      if (!originalMessage) {
+        socket.emit("error", "Message not found");
+        return;
+      }
+
+      // Create new conversation if needed
+      let conversation = await ConversationModel.findOne({
+        $or: [
+          {
+            sender: sender,
+            receiver: receiver,
+          },
+          {
+            sender: receiver,
+            receiver: sender,
+          },
+        ],
+      });
+
+      if (!conversation) {
+        const createConversation = await ConversationModel({
           sender: sender,
           receiver: receiver,
+        });
+        conversation = await createConversation.save();
+      }
+
+      // Create forwarded message
+      const message = new MessageModel({
+        text: originalMessage.text,
+        imageUrl: originalMessage.imageUrl,
+        videoUrl: originalMessage.videoUrl,
+        msgByUserId: sender,
+        forwardFrom: messageId
+      });
+      const saveMessage = await message.save();
+
+      // Update conversation
+      await ConversationModel.updateOne(
+        {
+          _id: conversation?._id,
         },
         {
-          sender: receiver,
-          receiver: sender,
-        },
-      ],
-    })
-      .populate("messages")
-      .sort({ updatedAt: -1 });
+          $push: { messages: saveMessage?._id },
+        }
+      );
 
-    // Emit updated messages to both users
-    io.to(sender).emit("message", getConversationMessage.messages || []);
-    io.to(receiver).emit("message", getConversationMessage.messages || []);
+      // Get updated conversation
+      const getConversationMessage = await ConversationModel.findById(conversation._id)
+        .populate({
+          path: "messages",
+          populate: [
+            {
+              path: "msgByUserId",
+              select: "name profile_pic"
+            },
+            {
+              path: "forwardFrom",
+              populate: {
+                path: "msgByUserId",
+                select: "name profile_pic"
+              }
+            }
+          ],
+          options: { sort: { createdAt: 1 } }
+        });
 
-    // Update conversations list
-    const conversationSender = await getConversation(sender);
-    const conversationReceiver = await getConversation(receiver);
+      // Emit updated messages to both users
+      io.to(sender).emit("message", getConversationMessage.messages || []);
+      io.to(receiver).emit("message", getConversationMessage.messages || []);
 
-    io.to(sender).emit("conversation", conversationSender);
-    io.to(receiver).emit("conversation", conversationReceiver);
+      // Update conversations list
+      const conversationSender = await getConversation(sender);
+      const conversationReceiver = await getConversation(receiver);
+
+      io.to(sender).emit("conversation", conversationSender);
+      io.to(receiver).emit("conversation", conversationReceiver);
+    } catch (error) {
+      console.error("Error forwarding message:", error);
+      socket.emit("error", "Could not forward message");
+    }
   });
 
   //sidebar
@@ -565,19 +587,24 @@ io.on("connection", async (socket) => {
   });
 
   // Handle message reactions
-  socket.on("react_to_message", async (data) => {
-    const { messageId, emoji } = data;
-
+  socket.on("react_to_message", async (reactionData) => {
     try {
+      const { messageId, emoji, userId } = reactionData;
       const message = await MessageModel.findById(messageId);
+      
       if (!message) {
         socket.emit("error", "Không tìm thấy tin nhắn");
         return;
       }
 
+      // Initialize reactions array if it doesn't exist
+      if (!message.reactions) {
+        message.reactions = [];
+      }
+
       // Kiểm tra xem user đã reaction chưa
       const existingReactionIndex = message.reactions.findIndex(
-        r => r.userId.toString() === user._id.toString() && r.emoji === emoji
+        r => r.userId.toString() === userId.toString() && r.emoji === emoji
       );
 
       if (existingReactionIndex > -1) {
@@ -586,7 +613,7 @@ io.on("connection", async (socket) => {
       } else {
         // Xóa reaction cũ của user (nếu có)
         const userReactionIndex = message.reactions.findIndex(
-          r => r.userId.toString() === user._id.toString()
+          r => r.userId.toString() === userId.toString()
         );
         if (userReactionIndex > -1) {
           message.reactions.splice(userReactionIndex, 1);
@@ -594,7 +621,7 @@ io.on("connection", async (socket) => {
         // Thêm reaction mới
         message.reactions.push({
           emoji,
-          userId: user._id
+          userId
         });
       }
 
@@ -607,8 +634,23 @@ io.on("connection", async (socket) => {
 
       if (conversation) {
         const getConversationMessage = await ConversationModel.findById(conversation._id)
-          .populate("messages")
-          .sort({ updatedAt: -1 });
+          .populate({
+            path: "messages",
+            populate: [
+              {
+                path: "msgByUserId",
+                select: "name profile_pic"
+              },
+              {
+                path: "replyTo",
+                populate: {
+                  path: "msgByUserId",
+                  select: "name profile_pic"
+                }
+              }
+            ],
+            options: { sort: { createdAt: 1 } }
+          });
 
         io.to(conversation.sender.toString()).emit(
           "message",
@@ -743,6 +785,31 @@ io.on("connection", async (socket) => {
     console.log("disconnect User", socket.id);
     onlineUser.delete(user?._id?.toString());
     io.emit("onlineUser", Array.from(onlineUser));
+  });
+
+  socket.on("get-friends", async () => {
+    try {
+      const currentUser = await UserModel.findById(user._id);
+      if (!currentUser) {
+        socket.emit("error", "User not found");
+        return;
+      }
+
+      // Lấy danh sách bạn bè của người dùng
+      const friends = await UserModel.find({
+        _id: { $in: currentUser.friends }
+      }).select("name profile_pic _id");
+
+      const friendsWithOnlineStatus = friends.map(friend => ({
+        ...friend.toObject(),
+        online: onlineUser.has(friend._id.toString())
+      }));
+
+      socket.emit("friends", friendsWithOnlineStatus);
+    } catch (error) {
+      console.error("Error getting friends list:", error);
+      socket.emit("error", "Could not get friends list");
+    }
   });
 });
 
