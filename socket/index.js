@@ -180,6 +180,7 @@ io.on("connection", async (socket) => {
     console.log("userId", userId);
 
     const userDetails = await UserModel.findById(userId).select("-password");
+    const currentUser = await UserModel.findById(user._id);
 
     const payload = {
       _id: userDetails?._id,
@@ -226,6 +227,7 @@ io.on("connection", async (socket) => {
     })
       .populate({
         path: "messages",
+        match: { _id: { $nin: currentUser?.deletedMessages || [] } },
         populate: [
           {
             path: "msgByUserId",
@@ -310,7 +312,9 @@ io.on("connection", async (socket) => {
         }
       );
 
-      const getConversationMessage = await ConversationModel.findOne({
+      // Lấy tin nhắn cho người gửi (không bao gồm tin nhắn đã xóa của họ)
+      const senderUser = await UserModel.findById(data.sender);
+      const getConversationMessageForSender = await ConversationModel.findOne({
         $or: [
           {
             sender: data?.sender,
@@ -324,6 +328,7 @@ io.on("connection", async (socket) => {
       })
         .populate({
           path: "messages",
+          match: { _id: { $nin: senderUser?.deletedMessages || [] } },
           populate: [
             {
               path: "msgByUserId",
@@ -340,8 +345,41 @@ io.on("connection", async (socket) => {
           options: { sort: { createdAt: 1 } }
         });
 
-      io.to(data?.sender).emit("message", getConversationMessage.messages || []);
-      io.to(data?.receiver).emit("message", getConversationMessage.messages || []);
+      // Lấy tin nhắn cho người nhận (không bao gồm tin nhắn đã xóa của họ)
+      const receiverUser = await UserModel.findById(data.receiver);
+      const getConversationMessageForReceiver = await ConversationModel.findOne({
+        $or: [
+          {
+            sender: data?.sender,
+            receiver: data?.receiver,
+          },
+          {
+            sender: data?.receiver,
+            receiver: data?.sender,
+          },
+        ],
+      })
+        .populate({
+          path: "messages",
+          match: { _id: { $nin: receiverUser?.deletedMessages || [] } },
+          populate: [
+            {
+              path: "msgByUserId",
+              select: "name profile_pic"
+            },
+            {
+              path: "replyTo",
+              populate: {
+                path: "msgByUserId",
+                select: "name profile_pic"
+              }
+            }
+          ],
+          options: { sort: { createdAt: 1 } }
+        });
+
+      io.to(data?.sender).emit("message", getConversationMessageForSender.messages || []);
+      io.to(data?.receiver).emit("message", getConversationMessageForReceiver.messages || []);
 
       //send conversation
       const conversationSender = await getConversation(data?.sender);
@@ -573,89 +611,77 @@ io.on("connection", async (socket) => {
 
   //handle delete message
   socket.on("delete-message", async (data) => {
-    const { messageId, senderId, receiverId } = data;
-    console.log("Deleting message:", data);
-
     try {
-      // Get the message
+      const { messageId, userId, conversationId } = data;
       const message = await MessageModel.findById(messageId);
+      
       if (!message) {
-        console.log("Message not found");
-        socket.emit("error", {
-          message: "Message not found",
-        });
+        socket.emit("delete-message-error", { error: "Message not found" });
         return;
       }
 
-      // Check if the user is part of the conversation
-      const conversation = await ConversationModel.findOne({
-        $or: [
-          { sender: senderId, receiver: receiverId },
-          { sender: receiverId, receiver: senderId },
-        ],
+      // Kiểm tra người dùng có trong cuộc trò chuyện không
+      const conversation = await ConversationModel.findById(conversationId);
+      if (!conversation) {
+        socket.emit("delete-message-error", { error: "Conversation not found" });
+        return;
+      }
+
+      // Kiểm tra người dùng có trong cuộc trò chuyện
+      const isUserInConversation = conversation.sender.toString() === userId.toString() || 
+                                  conversation.receiver.toString() === userId.toString();
+      
+      if (!isUserInConversation) {
+        socket.emit("delete-message-error", { error: "User not in conversation" });
+        return;
+      }
+
+      // Thêm tin nhắn vào danh sách đã xóa của người dùng
+      await UserModel.findByIdAndUpdate(userId, {
+        $addToSet: { deletedMessages: messageId }
       });
 
-      if (!conversation) {
-        console.log("Conversation not found");
-        socket.emit("error", {
-          message: "Conversation not found",
-        });
-        return;
-      }
+      // Gửi thông báo xóa tin nhắn thành công cho người gửi
+      socket.emit("delete-message-success", { messageId });
 
-      // Add the message to deletedMessages array for the user
-      const user = await UserModel.findById(senderId);
-      if (!user.deletedMessages) {
-        user.deletedMessages = [];
-      }
+      // Gửi thông báo cho người dùng khác trong cuộc trò chuyện
+      const otherUserId = conversation.sender.toString() === userId.toString() 
+        ? conversation.receiver.toString() 
+        : conversation.sender.toString();
       
-      // Check if message is already deleted
-      if (!user.deletedMessages.includes(messageId)) {
-        user.deletedMessages.push(messageId);
-        await user.save();
-      }
+      io.to(otherUserId).emit("message-deleted", { 
+        messageId,
+        conversationId
+      });
 
-      // Get updated conversation with properly sorted messages
-      const updatedConversation = await ConversationModel.findOne({
-        $or: [
-          { sender: senderId, receiver: receiverId },
-          { sender: receiverId, receiver: senderId },
-        ],
-      }).populate({
-        path: 'messages',
-        match: { _id: { $nin: user.deletedMessages } },
-        populate: [
-          {
-            path: "msgByUserId",
-            select: "name profile_pic"
-          },
-          {
-            path: "replyTo",
-            populate: {
+      // Cập nhật danh sách tin nhắn cho tất cả người dùng trong cuộc trò chuyện
+      const updatedConversation = await ConversationModel.findById(conversationId)
+        .populate({
+          path: 'messages',
+          match: { _id: { $nin: [messageId] } },
+          populate: [
+            {
               path: "msgByUserId",
               select: "name profile_pic"
+            },
+            {
+              path: "replyTo",
+              populate: {
+                path: "msgByUserId",
+                select: "name profile_pic"
+              }
             }
-          }
-        ],
-        options: { sort: { createdAt: 1 } }
-      });
+          ],
+          options: { sort: { createdAt: 1 } }
+        });
 
-      // Make sure messages array exists and is sorted
-      const sortedMessages = updatedConversation?.messages || [];
-      
-      // Send updated messages to the user who deleted
-      console.log("Sending updated messages to user");
-      io.to(senderId).emit("message", sortedMessages);
+      // Gửi tin nhắn cập nhật cho cả hai người dùng
+      io.to(conversation.sender.toString()).emit("message", updatedConversation.messages || []);
+      io.to(conversation.receiver.toString()).emit("message", updatedConversation.messages || []);
 
-      // Update conversation list for the user
-      const conversationSender = await getConversation(senderId);
-      io.to(senderId).emit("conversation", conversationSender);
-
-      // Send success response
-      socket.emit("delete-message-success", { messageId });
     } catch (error) {
       console.error("Error deleting message:", error);
-      socket.emit("error", { message: "Failed to delete message" });
+      socket.emit("delete-message-error", { error: error.message });
     }
   });
 
