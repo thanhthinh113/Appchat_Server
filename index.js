@@ -12,6 +12,7 @@ const logout = require("./controller/logout");
 const updateUserDetails = require("./controller/updateUserDetails");
 const resetPassword = require("./controller/resetPassword");
 const searchUser = require("./controller/searchUser");
+const { sendFriendRequest, handleFriendRequest } = require("./controller/friendRequest");
 const { app, server } = require("./socket/index");
 const checkPhone = require("./controller/checkPhone");
 
@@ -59,6 +60,8 @@ router.post("/update-user", updateUserDetails);
 router.post("/reset-password", resetPassword);
 
 router.post("/search-user", searchUser);
+router.post("/send-friend-request", sendFriendRequest);
+router.post("/handle-friend-request", handleFriendRequest);
 
 //check phone
 router.post("/check-phone", checkPhone);

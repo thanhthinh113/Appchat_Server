@@ -14,6 +14,12 @@ const messageSchema = new mongoose.Schema(
       type: String,
       default: "",
     },
+    fileUrl: {
+      type: String,
+    },
+    fileName: {
+      type: String,
+    },
     seen: {
       type: Boolean,
       default: false,
@@ -27,6 +33,10 @@ const messageSchema = new mongoose.Schema(
       type: mongoose.Schema.ObjectId,
       ref: "Message",
       default: null
+    },
+    replyTo: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Message",
     },
     reactions: [{
       emoji: {

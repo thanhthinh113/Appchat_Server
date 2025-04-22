@@ -40,6 +40,49 @@ io.on("connection", async (socket) => {
 
   io.emit("onlineUser", Array.from(onlineUser));
 
+  // Handle friend request
+  socket.on("send-friend-request", async (data) => {
+    const { targetUserId } = data;
+    const targetUser = await UserModel.findById(targetUserId);
+    
+    if (targetUser) {
+      // Emit to the target user
+      io.to(targetUserId).emit("new-friend-request", {
+        from: user._id,
+        name: user.name,
+        profile_pic: user.profile_pic
+      });
+    }
+  });
+
+  // Handle friend request response
+  socket.on("friend-request-response", async (data) => {
+    const { fromUserId, action } = data;
+    const fromUser = await UserModel.findById(fromUserId);
+    
+    if (fromUser) {
+      if (action === 'accept') {
+        // Emit to both users that they are now friends
+        io.to(fromUserId).emit("friend-request-accepted", {
+          userId: user._id,
+          name: user.name,
+          profile_pic: user.profile_pic
+        });
+        io.to(user._id.toString()).emit("friend-request-accepted", {
+          userId: fromUserId,
+          name: fromUser.name,
+          profile_pic: fromUser.profile_pic
+        });
+      } else if (action === 'reject') {
+        // Emit to the sender that their request was rejected
+        io.to(fromUserId).emit("friend-request-rejected", {
+          userId: user._id,
+          name: user.name
+        });
+      }
+    }
+  });
+
   socket.on("message-page", async (userId) => {
     console.log("userId", userId);
 
@@ -55,6 +98,26 @@ io.on("connection", async (socket) => {
 
     socket.emit("message-user", payload);
 
+    // Get conversation ID
+    const conversation = await ConversationModel.findOne({
+      $or: [
+        {
+          sender: user?._id,
+          receiver: userId,
+        },
+        {
+          sender: userId,
+          receiver: user?._id,
+        },
+      ],
+    });
+
+    if (conversation) {
+      socket.emit("conversation-id", {
+        conversationId: conversation._id
+      });
+    }
+
     //get previous message
     const getConversationMessage = await ConversationModel.findOne({
       $or: [
@@ -68,7 +131,23 @@ io.on("connection", async (socket) => {
         },
       ],
     })
-      .populate("messages")
+      .populate({
+        path: "messages",
+        populate: [
+          {
+            path: "msgByUserId",
+            select: "name profile_pic"
+          },
+          {
+            path: "replyTo",
+            populate: {
+              path: "msgByUserId",
+              select: "name profile_pic"
+            }
+          }
+        ],
+        options: { sort: { createdAt: 1 } }
+      })
       .sort({ updatedAt: -1 });
 
     socket.emit("message", getConversationMessage?.messages || []);
@@ -77,7 +156,6 @@ io.on("connection", async (socket) => {
   //new message
   socket.on("new massage", async (data) => {
     //check conversation is available both user
-
     let conversation = await ConversationModel.findOne({
       $or: [
         {
@@ -104,8 +182,11 @@ io.on("connection", async (socket) => {
       text: data.text,
       imageUrl: data.imageUrl,
       videoUrl: data.videoUrl,
+      fileUrl: data.fileUrl,
+      fileName: data.fileName,
       msgByUserId: data?.msgByUserId,
-      createdAt: new Date(), // Explicitly set creation time
+      replyTo: data?.replyTo,
+      createdAt: new Date(),
     });
     const saveMessage = await message.save();
 
@@ -117,6 +198,7 @@ io.on("connection", async (socket) => {
         $push: { messages: saveMessage?._id },
       }
     );
+
     const getConversationMessage = await ConversationModel.findOne({
       $or: [
         {
@@ -131,14 +213,24 @@ io.on("connection", async (socket) => {
     })
       .populate({
         path: "messages",
-        options: { sort: { createdAt: 1 } } // Sort by creation time ascending
+        populate: [
+          {
+            path: "msgByUserId",
+            select: "name profile_pic"
+          },
+          {
+            path: "replyTo",
+            populate: {
+              path: "msgByUserId",
+              select: "name profile_pic"
+            }
+          }
+        ],
+        options: { sort: { createdAt: 1 } }
       });
 
     io.to(data?.sender).emit("message", getConversationMessage.messages || []);
-    io.to(data?.receiver).emit(
-      "message",
-      getConversationMessage.messages || []
-    );
+    io.to(data?.receiver).emit("message", getConversationMessage.messages || []);
 
     //send conversation
     const conversationSender = await getConversation(data?.sender);
@@ -418,10 +510,82 @@ io.on("connection", async (socket) => {
     }
   });
 
+  // Handle message search
+  socket.on("search-messages", async (data) => {
+    try {
+      const { search, conversationId, currentUserId } = data;
+      
+      // Find the conversation and verify the user is part of it
+      const conversation = await ConversationModel.findOne({
+        _id: conversationId,
+        $or: [
+          { sender: currentUserId },
+          { receiver: currentUserId }
+        ]
+      });
+
+      if (!conversation) {
+        socket.emit("search-messages-error", {
+          message: "Conversation not found or you don't have access to it"
+        });
+        return;
+      }
+
+      // Create case-insensitive regex for search
+      const searchRegex = new RegExp(search, "i");
+
+      // Find messages in the conversation that match the search term
+      const messages = await MessageModel.find({
+        _id: { $in: conversation.messages },
+        $or: [
+          { text: searchRegex },
+          { imageUrl: { $regex: searchRegex } },
+          { videoUrl: { $regex: searchRegex } }
+        ]
+      })
+      .sort({ createdAt: -1 })
+      .populate({
+        path: 'msgByUserId',
+        select: 'name profile_pic'
+      });
+
+      // Format the response
+      const formattedMessages = messages.map(message => ({
+        _id: message._id,
+        text: message.text,
+        imageUrl: message.imageUrl,
+        videoUrl: message.videoUrl,
+        msgByUserId: {
+          _id: message.msgByUserId._id,
+          name: message.msgByUserId.name,
+          profile_pic: message.msgByUserId.profile_pic
+        },
+        createdAt: message.createdAt,
+        seen: message.seen,
+        reactions: message.reactions || [],
+        forwardFrom: message.forwardFrom
+      }));
+
+      // Emit search results to the client
+      socket.emit("search-messages-result", {
+        success: true,
+        data: formattedMessages
+      });
+
+    } catch (error) {
+      console.error("Error in search-messages socket:", error);
+      socket.emit("search-messages-error", {
+        message: "Error searching messages",
+        error: error.message
+      });
+    }
+  });
+
   //dissconnect
   socket.on("disconnect", () => {
-    onlineUser.delete(user._id);
-    console.log("disconnect user", socket.id);
+    console.log("disconnect User", socket.id);
+    onlineUser.delete(user?._id?.toString());
+    io.emit("onlineUser", Array.from(onlineUser));
   });
 });
 
