@@ -358,48 +358,53 @@ io.on("connection", async (socket) => {
   // Handle forward message
   socket.on("forward message", async (data) => {
     try {
-      const { messageId, sender, receiver } = data;
+      const { messageId, sender, receiver, currentChatUserId } = data;
 
       // Kiểm tra xem người nhận có phải là bạn bè không
       const currentUser = await UserModel.findById(sender);
+      const targetUser = await UserModel.findById(receiver);
+      
+      if (!currentUser || !targetUser) {
+        socket.emit("error", "Người dùng không tồn tại");
+        return;
+      }
+
       if (!currentUser.friends.includes(receiver)) {
-        socket.emit("error", "You can only forward messages to friends");
+        socket.emit("error", "Bạn chỉ có thể chuyển tiếp tin nhắn cho bạn bè");
         return;
       }
 
       // Kiểm tra không được chuyển tiếp cho chính mình
       if (sender === receiver) {
-        socket.emit("error", "Cannot forward message to yourself");
+        socket.emit("error", "Không thể chuyển tiếp tin nhắn cho chính mình");
         return;
       }
 
-      // Get the original message
-      const originalMessage = await MessageModel.findById(messageId);
+      // Get the original message with full details
+      const originalMessage = await MessageModel.findById(messageId)
+        .populate({
+          path: "msgByUserId",
+          select: "name profile_pic"
+        });
+
       if (!originalMessage) {
-        socket.emit("error", "Message not found");
+        socket.emit("error", "Không tìm thấy tin nhắn");
         return;
       }
 
       // Create new conversation if needed
       let conversation = await ConversationModel.findOne({
         $or: [
-          {
-            sender: sender,
-            receiver: receiver,
-          },
-          {
-            sender: receiver,
-            receiver: sender,
-          },
+          { sender: sender, receiver: receiver },
+          { sender: receiver, receiver: sender },
         ],
       });
 
       if (!conversation) {
-        const createConversation = await ConversationModel({
+        conversation = await ConversationModel.create({
           sender: sender,
           receiver: receiver,
         });
-        conversation = await createConversation.save();
       }
 
       // Create forwarded message
@@ -407,22 +412,22 @@ io.on("connection", async (socket) => {
         text: originalMessage.text,
         imageUrl: originalMessage.imageUrl,
         videoUrl: originalMessage.videoUrl,
+        fileUrl: originalMessage.fileUrl,
+        fileName: originalMessage.fileName,
         msgByUserId: sender,
-        forwardFrom: messageId
+        forwardFrom: originalMessage._id,
+        createdAt: new Date()
       });
+      
       const saveMessage = await message.save();
 
       // Update conversation
       await ConversationModel.updateOne(
-        {
-          _id: conversation?._id,
-        },
-        {
-          $push: { messages: saveMessage?._id },
-        }
+        { _id: conversation._id },
+        { $push: { messages: saveMessage._id } }
       );
 
-      // Get updated conversation
+      // Get updated conversation with full details
       const getConversationMessage = await ConversationModel.findById(conversation._id)
         .populate({
           path: "messages",
@@ -433,6 +438,13 @@ io.on("connection", async (socket) => {
             },
             {
               path: "forwardFrom",
+              populate: {
+                path: "msgByUserId",
+                select: "name profile_pic"
+              }
+            },
+            {
+              path: "replyTo",
               populate: {
                 path: "msgByUserId",
                 select: "name profile_pic"
@@ -452,9 +464,52 @@ io.on("connection", async (socket) => {
 
       io.to(sender).emit("conversation", conversationSender);
       io.to(receiver).emit("conversation", conversationReceiver);
+
+      // Load lại tin nhắn của cuộc trò chuyện hiện tại
+      const currentConversation = await ConversationModel.findOne({
+        $or: [
+          { sender: sender, receiver: currentChatUserId },
+          { sender: currentChatUserId, receiver: sender },
+        ],
+      })
+        .populate({
+          path: "messages",
+          populate: [
+            {
+              path: "msgByUserId",
+              select: "name profile_pic"
+            },
+            {
+              path: "forwardFrom",
+              populate: {
+                path: "msgByUserId",
+                select: "name profile_pic"
+              }
+            },
+            {
+              path: "replyTo",
+              populate: {
+                path: "msgByUserId",
+                select: "name profile_pic"
+              }
+            }
+          ],
+          options: { sort: { createdAt: 1 } }
+        });
+
+      if (currentConversation) {
+        io.to(sender).emit("message", currentConversation.messages || []);
+      }
+
+      // Send success notification
+      socket.emit("forward-message-success", {
+        messageId: saveMessage._id,
+        originalMessageId: originalMessage._id
+      });
+
     } catch (error) {
       console.error("Error forwarding message:", error);
-      socket.emit("error", "Could not forward message");
+      socket.emit("error", "Không thể chuyển tiếp tin nhắn");
     }
   });
 
@@ -522,35 +577,43 @@ io.on("connection", async (socket) => {
     console.log("Deleting message:", data);
 
     try {
-      // Verify that the sender is the one deleting the message
-      const message = await MessageModel.findOne({
-        _id: messageId,
-        msgByUserId: senderId,
-      });
-
+      // Get the message
+      const message = await MessageModel.findById(messageId);
       if (!message) {
-        console.log("Message not found or not authorized");
+        console.log("Message not found");
         socket.emit("error", {
-          message: "Message not found or not authorized",
+          message: "Message not found",
         });
         return;
       }
 
-      // Delete the message
-      const deleteResult = await MessageModel.deleteOne({ _id: messageId });
-      console.log("Delete result:", deleteResult);
+      // Check if the user is part of the conversation
+      const conversation = await ConversationModel.findOne({
+        $or: [
+          { sender: senderId, receiver: receiverId },
+          { sender: receiverId, receiver: senderId },
+        ],
+      });
 
-      // Remove message reference from conversation
-      const updateResult = await ConversationModel.updateOne(
-        {
-          $or: [
-            { sender: senderId, receiver: receiverId },
-            { sender: receiverId, receiver: senderId },
-          ],
-        },
-        { $pull: { messages: messageId } }
-      );
-      console.log("Update conversation result:", updateResult);
+      if (!conversation) {
+        console.log("Conversation not found");
+        socket.emit("error", {
+          message: "Conversation not found",
+        });
+        return;
+      }
+
+      // Add the message to deletedMessages array for the user
+      const user = await UserModel.findById(senderId);
+      if (!user.deletedMessages) {
+        user.deletedMessages = [];
+      }
+      
+      // Check if message is already deleted
+      if (!user.deletedMessages.includes(messageId)) {
+        user.deletedMessages.push(messageId);
+        await user.save();
+      }
 
       // Get updated conversation with properly sorted messages
       const updatedConversation = await ConversationModel.findOne({
@@ -560,23 +623,33 @@ io.on("connection", async (socket) => {
         ],
       }).populate({
         path: 'messages',
-        options: { sort: { 'createdAt': 1 } } // Sort by creation time ascending
+        match: { _id: { $nin: user.deletedMessages } },
+        populate: [
+          {
+            path: "msgByUserId",
+            select: "name profile_pic"
+          },
+          {
+            path: "replyTo",
+            populate: {
+              path: "msgByUserId",
+              select: "name profile_pic"
+            }
+          }
+        ],
+        options: { sort: { createdAt: 1 } }
       });
 
       // Make sure messages array exists and is sorted
       const sortedMessages = updatedConversation?.messages || [];
       
-      // Send updated messages to both users
-      console.log("Sending updated messages to users");
+      // Send updated messages to the user who deleted
+      console.log("Sending updated messages to user");
       io.to(senderId).emit("message", sortedMessages);
-      io.to(receiverId).emit("message", sortedMessages);
 
-      // Update conversation list for both users
+      // Update conversation list for the user
       const conversationSender = await getConversation(senderId);
-      const conversationReceiver = await getConversation(receiverId);
-
       io.to(senderId).emit("conversation", conversationSender);
-      io.to(receiverId).emit("conversation", conversationReceiver);
 
       // Send success response
       socket.emit("delete-message-success", { messageId });

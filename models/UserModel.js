@@ -33,7 +33,13 @@ const userSchema = new mongoose.Schema(
         enum: ['pending', 'accepted', 'rejected'],
         default: 'pending'
       }
-    }]
+    }],
+    deletedMessages: [
+      {
+        type: mongoose.Schema.ObjectId,
+        ref: "Message",
+      },
+    ],
   },
   {
     timestamps: true,
