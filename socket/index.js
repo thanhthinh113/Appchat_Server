@@ -644,21 +644,15 @@ io.on("connection", async (socket) => {
       // Gửi thông báo xóa tin nhắn thành công cho người gửi
       socket.emit("delete-message-success", { messageId });
 
-      // Gửi thông báo cho người dùng khác trong cuộc trò chuyện
-      const otherUserId = conversation.sender.toString() === userId.toString() 
-        ? conversation.receiver.toString() 
-        : conversation.sender.toString();
-      
-      io.to(otherUserId).emit("message-deleted", { 
-        messageId,
-        conversationId
-      });
+      // Lấy danh sách tin nhắn đã xóa của người dùng
+      const user = await UserModel.findById(userId);
+      const deletedMessages = user.deletedMessages || [];
 
-      // Cập nhật danh sách tin nhắn cho tất cả người dùng trong cuộc trò chuyện
+      // Lấy danh sách tin nhắn đã cập nhật cho người xóa
       const updatedConversation = await ConversationModel.findById(conversationId)
         .populate({
           path: 'messages',
-          match: { _id: { $nin: [messageId] } },
+          match: { _id: { $nin: deletedMessages } }, // Lọc tất cả tin nhắn đã xóa
           populate: [
             {
               path: "msgByUserId",
@@ -675,9 +669,8 @@ io.on("connection", async (socket) => {
           options: { sort: { createdAt: 1 } }
         });
 
-      // Gửi tin nhắn cập nhật cho cả hai người dùng
-      io.to(conversation.sender.toString()).emit("message", updatedConversation.messages || []);
-      io.to(conversation.receiver.toString()).emit("message", updatedConversation.messages || []);
+      // Chỉ gửi tin nhắn cập nhật cho người xóa
+      io.to(userId).emit("message", updatedConversation.messages || []);
 
     } catch (error) {
       console.error("Error deleting message:", error);
@@ -726,39 +719,28 @@ io.on("connection", async (socket) => {
 
       await message.save();
 
-      // Lấy conversation và emit lại messages cho cả 2 bên
+      // Lấy thông tin người dùng để gửi về client
+      const user = await UserModel.findById(userId).select("name profile_pic");
+
+      // Gửi thông báo cập nhật reaction cho cả hai người dùng
       const conversation = await ConversationModel.findOne({
         messages: messageId
       });
 
       if (conversation) {
-        const getConversationMessage = await ConversationModel.findById(conversation._id)
-          .populate({
-            path: "messages",
-            populate: [
-              {
-                path: "msgByUserId",
-                select: "name profile_pic"
-              },
-              {
-                path: "replyTo",
-                populate: {
-                  path: "msgByUserId",
-                  select: "name profile_pic"
-                }
-              }
-            ],
-            options: { sort: { createdAt: 1 } }
-          });
+        // Gửi thông tin cập nhật reaction
+        const reactionUpdate = {
+          messageId,
+          reactions: message.reactions,
+          user: {
+            _id: user._id,
+            name: user.name,
+            profile_pic: user.profile_pic
+          }
+        };
 
-        io.to(conversation.sender.toString()).emit(
-          "message",
-          getConversationMessage.messages || []
-        );
-        io.to(conversation.receiver.toString()).emit(
-          "message",
-          getConversationMessage.messages || []
-        );
+        io.to(conversation.sender.toString()).emit("reaction-updated", reactionUpdate);
+        io.to(conversation.receiver.toString()).emit("reaction-updated", reactionUpdate);
       }
     } catch (error) {
       console.error("Lỗi khi xử lý reaction:", error);
