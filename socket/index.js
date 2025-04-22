@@ -4,6 +4,7 @@ const http = require("http");
 const getUserDetailFromToken = require("../helpers/getUserDetailFromToken");
 const UserModel = require("../models/UserModel");
 const getConversation = require("../helpers/getConversation");
+const FriendRequestModel = require("../models/FriendRequestModel");
 
 const {
   ConversationModel,
@@ -42,44 +43,136 @@ io.on("connection", async (socket) => {
 
   // Handle friend request
   socket.on("send-friend-request", async (data) => {
-    const { targetUserId } = data;
-    const targetUser = await UserModel.findById(targetUserId);
-    
-    if (targetUser) {
-      // Emit to the target user
-      io.to(targetUserId).emit("new-friend-request", {
-        from: user._id,
-        name: user.name,
-        profile_pic: user.profile_pic
+    try {
+      const { targetUserId } = data;
+      const currentUser = await UserModel.findById(user._id);
+      const targetUser = await UserModel.findById(targetUserId);
+      
+      if (!currentUser || !targetUser) {
+        socket.emit("error", "Người dùng không tồn tại");
+        return;
+      }
+      
+      if (currentUser.friends.includes(targetUserId)) {
+        socket.emit("error", "Các bạn đã là bạn bè");
+        return;
+      }
+      
+      // Xóa yêu cầu kết bạn cũ nếu có
+      await FriendRequestModel.deleteMany({
+        $or: [
+          { sender: user._id, receiver: targetUserId },
+          { sender: targetUserId, receiver: user._id }
+        ]
       });
+      
+      const newRequest = new FriendRequestModel({
+        sender: user._id,
+        receiver: targetUserId,
+        status: 'pending'
+      });
+      
+      await newRequest.save();
+      
+      if (onlineUser.has(targetUserId)) {
+        io.to(targetUserId).emit("new-friend-request", {
+          requestId: newRequest._id,
+          sender: {
+            _id: currentUser._id,
+            name: currentUser.name,
+            profile_pic: currentUser.profile_pic
+          }
+        });
+      }
+      
+      socket.emit("friend-request-sent", { 
+        success: true,
+        requestId: newRequest._id
+      });
+      
+    } catch (error) {
+      console.error("Error sending friend request:", error);
+      socket.emit("error", "Có lỗi xảy ra khi gửi yêu cầu kết bạn");
     }
   });
 
   // Handle friend request response
   socket.on("friend-request-response", async (data) => {
-    const { fromUserId, action } = data;
-    const fromUser = await UserModel.findById(fromUserId);
-    
-    if (fromUser) {
+    try {
+      const { requestId, action } = data;
+      
+      const friendRequest = await FriendRequestModel.findById(requestId);
+      
+      if (!friendRequest) {
+        socket.emit("error", "Không tìm thấy yêu cầu kết bạn");
+        return;
+      }
+      
+      if (friendRequest.receiver.toString() !== user._id.toString()) {
+        socket.emit("error", "Bạn không có quyền xử lý yêu cầu này");
+        return;
+      }
+      
       if (action === 'accept') {
-        // Emit to both users that they are now friends
-        io.to(fromUserId).emit("friend-request-accepted", {
-          userId: user._id,
-          name: user.name,
-          profile_pic: user.profile_pic
+        // Thêm vào danh sách bạn bè
+        await UserModel.updateOne(
+          { _id: friendRequest.sender },
+          { $addToSet: { friends: friendRequest.receiver } }
+        );
+        await UserModel.updateOne(
+          { _id: friendRequest.receiver },
+          { $addToSet: { friends: friendRequest.sender } }
+        );
+        
+        // Thông báo cho người gửi
+        if (onlineUser.has(friendRequest.sender.toString())) {
+          const receiver = await UserModel.findById(user._id);
+          io.to(friendRequest.sender.toString()).emit("friend-request-accepted", {
+            requestId: friendRequest._id,
+            friend: {
+              _id: receiver._id,
+              name: receiver.name,
+              profile_pic: receiver.profile_pic
+            }
+          });
+        }
+        
+        // Thông báo cho người nhận
+        socket.emit("friend-request-accepted", {
+          requestId: friendRequest._id,
+          friend: {
+            _id: friendRequest.sender,
+            name: (await UserModel.findById(friendRequest.sender)).name,
+            profile_pic: (await UserModel.findById(friendRequest.sender)).profile_pic
+          }
         });
-        io.to(user._id.toString()).emit("friend-request-accepted", {
-          userId: fromUserId,
-          name: fromUser.name,
-          profile_pic: fromUser.profile_pic
-        });
+        
       } else if (action === 'reject') {
-        // Emit to the sender that their request was rejected
-        io.to(fromUserId).emit("friend-request-rejected", {
-          userId: user._id,
-          name: user.name
+        // Thông báo cho người gửi
+        if (onlineUser.has(friendRequest.sender.toString())) {
+          io.to(friendRequest.sender.toString()).emit("friend-request-rejected", {
+            requestId: friendRequest._id
+          });
+        }
+        
+        // Thông báo cho người nhận
+        socket.emit("friend-request-rejected", {
+          requestId: friendRequest._id
         });
       }
+
+      // Xóa yêu cầu kết bạn sau khi xử lý xong
+      await FriendRequestModel.deleteOne({ _id: requestId });
+      
+      socket.emit("friend-request-handled", { 
+        success: true,
+        action,
+        requestId: friendRequest._id
+      });
+      
+    } catch (error) {
+      console.error("Error handling friend request:", error);
+      socket.emit("error", "Có lỗi xảy ra khi xử lý yêu cầu kết bạn");
     }
   });
 
@@ -155,89 +248,111 @@ io.on("connection", async (socket) => {
 
   //new message
   socket.on("new massage", async (data) => {
-    //check conversation is available both user
-    let conversation = await ConversationModel.findOne({
-      $or: [
-        {
-          sender: data?.sender,
-          receiver: data?.receiver,
-        },
-        {
-          sender: data?.receiver,
-          receiver: data?.sender,
-        },
-      ],
-    });
+    try {
+      // Check if users are friends
+      const currentUser = await UserModel.findById(data.sender);
+      const targetUser = await UserModel.findById(data.receiver);
 
-    //if conversation is not available
-    if (!conversation) {
-      const createConversation = await ConversationModel({
-        sender: data?.sender,
-        receiver: data?.receiver,
-      });
-      conversation = await createConversation.save();
-    }
-
-    const message = new MessageModel({
-      text: data.text,
-      imageUrl: data.imageUrl,
-      videoUrl: data.videoUrl,
-      fileUrl: data.fileUrl,
-      fileName: data.fileName,
-      msgByUserId: data?.msgByUserId,
-      replyTo: data?.replyTo,
-      createdAt: new Date(),
-    });
-    const saveMessage = await message.save();
-
-    const updateConversation = await ConversationModel.updateOne(
-      {
-        _id: conversation?._id,
-      },
-      {
-        $push: { messages: saveMessage?._id },
+      if (!currentUser || !targetUser) {
+        socket.emit("error", "Người dùng không tồn tại");
+        return;
       }
-    );
 
-    const getConversationMessage = await ConversationModel.findOne({
-      $or: [
-        {
-          sender: data?.sender,
-          receiver: data?.receiver,
-        },
-        {
-          sender: data?.receiver,
-          receiver: data?.sender,
-        },
-      ],
-    })
-      .populate({
-        path: "messages",
-        populate: [
+      const areFriends = currentUser.friends.includes(data.receiver) && 
+                        targetUser.friends.includes(data.sender);
+
+      if (!areFriends) {
+        socket.emit("error", "Bạn cần kết bạn để có thể nhắn tin");
+        return;
+      }
+
+      //check conversation is available both user
+      let conversation = await ConversationModel.findOne({
+        $or: [
           {
-            path: "msgByUserId",
-            select: "name profile_pic"
+            sender: data?.sender,
+            receiver: data?.receiver,
           },
           {
-            path: "replyTo",
-            populate: {
-              path: "msgByUserId",
-              select: "name profile_pic"
-            }
-          }
+            sender: data?.receiver,
+            receiver: data?.sender,
+          },
         ],
-        options: { sort: { createdAt: 1 } }
       });
 
-    io.to(data?.sender).emit("message", getConversationMessage.messages || []);
-    io.to(data?.receiver).emit("message", getConversationMessage.messages || []);
+      //if conversation is not available
+      if (!conversation) {
+        const createConversation = await ConversationModel({
+          sender: data?.sender,
+          receiver: data?.receiver,
+        });
+        conversation = await createConversation.save();
+      }
 
-    //send conversation
-    const conversationSender = await getConversation(data?.sender);
-    const conversationReceiver = await getConversation(data?.receiver);
+      const message = new MessageModel({
+        text: data.text,
+        imageUrl: data.imageUrl,
+        videoUrl: data.videoUrl,
+        fileUrl: data.fileUrl,
+        fileName: data.fileName,
+        msgByUserId: data?.msgByUserId,
+        replyTo: data?.replyTo,
+        createdAt: new Date(),
+      });
+      const saveMessage = await message.save();
 
-    io.to(data?.sender).emit("conversation", conversationSender);
-    io.to(data?.receiver).emit("conversation", conversationReceiver);
+      const updateConversation = await ConversationModel.updateOne(
+        {
+          _id: conversation?._id,
+        },
+        {
+          $push: { messages: saveMessage?._id },
+        }
+      );
+
+      const getConversationMessage = await ConversationModel.findOne({
+        $or: [
+          {
+            sender: data?.sender,
+            receiver: data?.receiver,
+          },
+          {
+            sender: data?.receiver,
+            receiver: data?.sender,
+          },
+        ],
+      })
+        .populate({
+          path: "messages",
+          populate: [
+            {
+              path: "msgByUserId",
+              select: "name profile_pic"
+            },
+            {
+              path: "replyTo",
+              populate: {
+                path: "msgByUserId",
+                select: "name profile_pic"
+              }
+            }
+          ],
+          options: { sort: { createdAt: 1 } }
+        });
+
+      io.to(data?.sender).emit("message", getConversationMessage.messages || []);
+      io.to(data?.receiver).emit("message", getConversationMessage.messages || []);
+
+      //send conversation
+      const conversationSender = await getConversation(data?.sender);
+      const conversationReceiver = await getConversation(data?.receiver);
+
+      io.to(data?.sender).emit("conversation", conversationSender);
+      io.to(data?.receiver).emit("conversation", conversationReceiver);
+    } catch (error) {
+      console.error("Error sending message:", error);
+      socket.emit("error", "Có lỗi xảy ra khi gửi tin nhắn");
+    }
   });
 
   // Forward message
@@ -578,6 +693,48 @@ io.on("connection", async (socket) => {
         message: "Error searching messages",
         error: error.message
       });
+    }
+  });
+
+  // Handle unfriend request
+  socket.on("unfriend", async (data) => {
+    try {
+      const { targetUserId } = data;
+      const currentUser = await UserModel.findById(user._id);
+      const targetUser = await UserModel.findById(targetUserId);
+      
+      if (!currentUser || !targetUser) {
+        socket.emit("error", "Người dùng không tồn tại");
+        return;
+      }
+
+      // Xóa khỏi danh sách bạn bè của cả hai người dùng
+      await UserModel.updateOne(
+        { _id: user._id },
+        { $pull: { friends: targetUserId } }
+      );
+      
+      await UserModel.updateOne(
+        { _id: targetUserId },
+        { $pull: { friends: user._id } }
+      );
+
+      // Thông báo cho cả hai người dùng
+      socket.emit("unfriend-success", {
+        targetUserId,
+        message: "Đã hủy kết bạn"
+      });
+
+      if (onlineUser.has(targetUserId)) {
+        io.to(targetUserId).emit("unfriend-received", {
+          userId: user._id,
+          message: "Đã hủy kết bạn"
+        });
+      }
+      
+    } catch (error) {
+      console.error("Error unfriending:", error);
+      socket.emit("error", "Có lỗi xảy ra khi hủy kết bạn");
     }
   });
 

@@ -1,4 +1,5 @@
 const UserModel = require("../models/UserModel");
+const FriendRequestModel = require("../models/FriendRequestModel");
 
 async function sendFriendRequest(request, response) {
   try {
@@ -31,28 +32,78 @@ async function sendFriendRequest(request, response) {
     }
 
     // Check if request already exists
-    const existingRequest = targetUser.friendRequests.find(
-      request => request.from.toString() === currentUserId && request.status === 'pending'
-    );
+    const existingRequest = await FriendRequestModel.findOne({
+      $or: [
+        { sender: currentUserId, receiver: targetUserId, status: 'pending' },
+        { sender: targetUserId, receiver: currentUserId, status: 'pending' }
+      ]
+    });
 
     if (existingRequest) {
       return response.status(400).json({
-        message: "Friend request already sent",
+        message: "Friend request already exists",
         error: true
       });
     }
 
-    // Add friend request
-    targetUser.friendRequests.push({
-      from: currentUserId,
+    // Create new friend request
+    const newRequest = new FriendRequestModel({
+      sender: currentUserId,
+      receiver: targetUserId,
       status: 'pending'
     });
 
-    await targetUser.save();
+    await newRequest.save();
 
     return response.json({
       message: "Friend request sent successfully",
-      success: true
+      success: true,
+      requestId: newRequest._id
+    });
+  } catch (error) {
+    return response.status(500).json({
+      message: error.message || "Something went wrong",
+      error: true
+    });
+  }
+}
+
+async function checkFriendRequest(request, response) {
+  try {
+    const { currentUserId, targetUserId } = request.body;
+
+    if (!currentUserId || !targetUserId) {
+      return response.status(400).json({
+        message: "Both currentUserId and targetUserId are required",
+        error: true
+      });
+    }
+
+    // Check if users are friends
+    const currentUser = await UserModel.findById(currentUserId);
+    if (!currentUser) {
+      return response.status(404).json({
+        message: "Current user not found",
+        error: true
+      });
+    }
+
+    const isFriend = currentUser.friends.includes(targetUserId);
+
+    // Check for pending friend request
+    const friendRequest = await FriendRequestModel.findOne({
+      $or: [
+        { sender: currentUserId, receiver: targetUserId, status: 'pending' },
+        { sender: targetUserId, receiver: currentUserId, status: 'pending' }
+      ]
+    });
+
+    return response.json({
+      success: true,
+      isFriend,
+      hasPendingRequest: !!friendRequest,
+      requestId: friendRequest?._id,
+      isReceiver: friendRequest ? friendRequest.receiver.toString() === currentUserId : false
     });
   } catch (error) {
     return response.status(500).json({
@@ -73,37 +124,41 @@ async function handleFriendRequest(request, response) {
       });
     }
 
-    const currentUser = await UserModel.findById(currentUserId);
-    const requestIndex = currentUser.friendRequests.findIndex(
-      req => req._id.toString() === requestId
-    );
+    const friendRequest = await FriendRequestModel.findById(requestId);
 
-    if (requestIndex === -1) {
+    if (!friendRequest) {
       return response.status(404).json({
         message: "Friend request not found",
         error: true
       });
     }
 
-    const requestData = currentUser.friendRequests[requestIndex];
-    const senderId = requestData.from;
-
-    if (action === 'accept') {
-      // Add to friends list
-      currentUser.friends.push(senderId);
-      const sender = await UserModel.findById(senderId);
-      sender.friends.push(currentUserId);
-
-      // Update request status
-      currentUser.friendRequests[requestIndex].status = 'accepted';
-      
-      await sender.save();
-    } else if (action === 'reject') {
-      // Update request status
-      currentUser.friendRequests[requestIndex].status = 'rejected';
+    if (friendRequest.receiver.toString() !== currentUserId) {
+      return response.status(403).json({
+        message: "You don't have permission to handle this request",
+        error: true
+      });
     }
 
-    await currentUser.save();
+    if (action === 'accept') {
+      // Update request status
+      friendRequest.status = 'accepted';
+      await friendRequest.save();
+
+      // Add to friends list
+      await UserModel.updateOne(
+        { _id: friendRequest.sender },
+        { $addToSet: { friends: friendRequest.receiver } }
+      );
+      await UserModel.updateOne(
+        { _id: friendRequest.receiver },
+        { $addToSet: { friends: friendRequest.sender } }
+      );
+    } else if (action === 'reject') {
+      // Update request status
+      friendRequest.status = 'rejected';
+      await friendRequest.save();
+    }
 
     return response.json({
       message: `Friend request ${action}ed successfully`,
@@ -117,4 +172,8 @@ async function handleFriendRequest(request, response) {
   }
 }
 
-module.exports = { sendFriendRequest, handleFriendRequest }; 
+module.exports = {
+  sendFriendRequest,
+  checkFriendRequest,
+  handleFriendRequest
+}; 
