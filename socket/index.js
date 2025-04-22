@@ -893,6 +893,102 @@ io.on("connection", async (socket) => {
       socket.emit("error", "Could not get friends list");
     }
   });
+
+  // Handle recall message
+  socket.on("recall-message", async (data) => {
+    try {
+      const { messageId, userId, conversationId } = data;
+      const message = await MessageModel.findById(messageId);
+      
+      if (!message) {
+        socket.emit("recall-message-error", { error: "Message not found" });
+        return;
+      }
+
+      // Kiểm tra xem người dùng có phải là người gửi tin nhắn không
+      if (message.msgByUserId.toString() !== userId) {
+        socket.emit("recall-message-error", { error: "You can only recall your own messages" });
+        return;
+      }
+
+      // Kiểm tra người dùng có trong cuộc trò chuyện không
+      const conversation = await ConversationModel.findById(conversationId);
+      if (!conversation) {
+        socket.emit("recall-message-error", { error: "Conversation not found" });
+        return;
+      }
+
+      // Kiểm tra người dùng có trong cuộc trò chuyện
+      const isUserInConversation = conversation.sender.toString() === userId.toString() || 
+                                  conversation.receiver.toString() === userId.toString();
+      
+      if (!isUserInConversation) {
+        socket.emit("recall-message-error", { error: "User not in conversation" });
+        return;
+      }
+
+      // Đánh dấu tin nhắn đã thu hồi
+      message.isRecalled = true;
+      await message.save();
+
+      // Gửi thông báo thu hồi tin nhắn thành công cho người gửi
+      socket.emit("recall-message-success", { messageId });
+
+      // Lấy danh sách tin nhắn đã xóa của người dùng
+      const senderUser = await UserModel.findById(conversation.sender);
+      const receiverUser = await UserModel.findById(conversation.receiver);
+
+      // Lấy danh sách tin nhắn đã cập nhật cho người gửi
+      const updatedConversationForSender = await ConversationModel.findById(conversationId)
+        .populate({
+          path: 'messages',
+          match: { _id: { $nin: senderUser?.deletedMessages || [] } },
+          populate: [
+            {
+              path: "msgByUserId",
+              select: "name profile_pic"
+            },
+            {
+              path: "replyTo",
+              populate: {
+                path: "msgByUserId",
+                select: "name profile_pic"
+              }
+            }
+          ],
+          options: { sort: { createdAt: 1 } }
+        });
+
+      // Lấy danh sách tin nhắn đã cập nhật cho người nhận
+      const updatedConversationForReceiver = await ConversationModel.findById(conversationId)
+        .populate({
+          path: 'messages',
+          match: { _id: { $nin: receiverUser?.deletedMessages || [] } },
+          populate: [
+            {
+              path: "msgByUserId",
+              select: "name profile_pic"
+            },
+            {
+              path: "replyTo",
+              populate: {
+                path: "msgByUserId",
+                select: "name profile_pic"
+              }
+            }
+          ],
+          options: { sort: { createdAt: 1 } }
+        });
+
+      // Gửi tin nhắn cập nhật cho từng người dùng
+      io.to(conversation.sender.toString()).emit("message", updatedConversationForSender.messages || []);
+      io.to(conversation.receiver.toString()).emit("message", updatedConversationForReceiver.messages || []);
+
+    } catch (error) {
+      console.error("Error recalling message:", error);
+      socket.emit("recall-message-error", { error: error.message });
+    }
+  });
 });
 
 module.exports = {
