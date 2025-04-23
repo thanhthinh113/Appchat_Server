@@ -669,8 +669,17 @@ io.on("connection", async (socket) => {
           options: { sort: { createdAt: 1 } }
         });
 
+      // Đảm bảo trạng thái isRecalled được giữ nguyên
+      const processedMessages = updatedConversation.messages.map(msg => {
+        const messageObj = msg.toObject();
+        if (messageObj._id.toString() === messageId) {
+          messageObj.isRecalled = true;
+        }
+        return messageObj;
+      });
+
       // Chỉ gửi tin nhắn cập nhật cho người xóa
-      io.to(userId).emit("message", updatedConversation.messages || []);
+      io.to(userId).emit("message", processedMessages || []);
 
     } catch (error) {
       console.error("Error deleting message:", error);
@@ -931,18 +940,14 @@ io.on("connection", async (socket) => {
       message.isRecalled = true;
       await message.save();
 
-      // Gửi thông báo thu hồi tin nhắn thành công cho người gửi
-      socket.emit("recall-message-success", { messageId });
+      // Gửi thông báo thu hồi tin nhắn thành công cho cả hai người dùng
+      io.to(conversation.sender.toString()).emit("recall-message-success", { messageId });
+      io.to(conversation.receiver.toString()).emit("recall-message-success", { messageId });
 
-      // Lấy danh sách tin nhắn đã xóa của người dùng
-      const senderUser = await UserModel.findById(conversation.sender);
-      const receiverUser = await UserModel.findById(conversation.receiver);
-
-      // Lấy danh sách tin nhắn đã cập nhật cho người gửi
-      const updatedConversationForSender = await ConversationModel.findById(conversationId)
+      // Lấy danh sách tin nhắn đã cập nhật cho cả hai người dùng
+      const updatedConversation = await ConversationModel.findById(conversationId)
         .populate({
           path: 'messages',
-          match: { _id: { $nin: senderUser?.deletedMessages || [] } },
           populate: [
             {
               path: "msgByUserId",
@@ -959,30 +964,18 @@ io.on("connection", async (socket) => {
           options: { sort: { createdAt: 1 } }
         });
 
-      // Lấy danh sách tin nhắn đã cập nhật cho người nhận
-      const updatedConversationForReceiver = await ConversationModel.findById(conversationId)
-        .populate({
-          path: 'messages',
-          match: { _id: { $nin: receiverUser?.deletedMessages || [] } },
-          populate: [
-            {
-              path: "msgByUserId",
-              select: "name profile_pic"
-            },
-            {
-              path: "replyTo",
-              populate: {
-                path: "msgByUserId",
-                select: "name profile_pic"
-              }
-            }
-          ],
-          options: { sort: { createdAt: 1 } }
-        });
+      // Đảm bảo trạng thái isRecalled được giữ nguyên
+      const processedMessages = updatedConversation.messages.map(msg => {
+        const messageObj = msg.toObject();
+        if (messageObj._id.toString() === messageId) {
+          messageObj.isRecalled = true;
+        }
+        return messageObj;
+      });
 
-      // Gửi tin nhắn cập nhật cho từng người dùng
-      io.to(conversation.sender.toString()).emit("message", updatedConversationForSender.messages || []);
-      io.to(conversation.receiver.toString()).emit("message", updatedConversationForReceiver.messages || []);
+      // Gửi tin nhắn cập nhật cho cả hai người dùng
+      io.to(conversation.sender.toString()).emit("message", processedMessages || []);
+      io.to(conversation.receiver.toString()).emit("message", processedMessages || []);
 
     } catch (error) {
       console.error("Error recalling message:", error);
