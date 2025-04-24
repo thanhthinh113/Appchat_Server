@@ -24,6 +24,10 @@ const groupChatSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "Message",
     },
+    messages: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Message"
+    }],
     isGroup: {
       type: Boolean,
       default: true
