@@ -5,6 +5,7 @@ const getUserDetailFromToken = require("../helpers/getUserDetailFromToken");
 const UserModel = require("../models/UserModel");
 const getConversation = require("../helpers/getConversation");
 const FriendRequestModel = require("../models/FriendRequestModel");
+const GroupChatModel = require("../models/GroupChatModel");
 
 const {
   ConversationModel,
@@ -903,6 +904,27 @@ io.on("connection", async (socket) => {
     }
   });
 
+  // Thêm handler cho get-user-groups
+  socket.on("get-user-groups", async () => {
+    try {
+      // Tìm tất cả các nhóm mà user là thành viên hoặc người tạo
+      const userGroups = await GroupChatModel.find({
+        $or: [
+          { members: user._id },
+          { creator: user._id }
+        ]
+      })
+      .populate("members", "name profile_pic")
+      .populate("creator", "name profile_pic")
+      .populate("lastMessage");
+
+      socket.emit("user-groups", userGroups);
+    } catch (error) {
+      console.error("Error getting user groups:", error);
+      socket.emit("error", "Không thể lấy danh sách nhóm");
+    }
+  });
+
   // Handle recall message
   socket.on("recall-message", async (data) => {
     try {
@@ -971,7 +993,7 @@ io.on("connection", async (socket) => {
           messageObj.isRecalled = true;
         }
         return messageObj;
-      });
+        });
 
       // Gửi tin nhắn cập nhật cho cả hai người dùng
       io.to(conversation.sender.toString()).emit("message", processedMessages || []);
@@ -980,6 +1002,124 @@ io.on("connection", async (socket) => {
     } catch (error) {
       console.error("Error recalling message:", error);
       socket.emit("recall-message-error", { error: error.message });
+    }
+  });
+
+  // Handle create group
+  socket.on("create-group", async (data) => {
+    try {
+      const { name, members, creator } = data;
+
+      // Validate input
+      if (!name || !members || !members.length || !creator) {
+        socket.emit("error", "Thiếu thông tin cần thiết để tạo nhóm");
+        return;
+      }
+
+      // Kiểm tra xem người tạo có tồn tại không
+      const creatorUser = await UserModel.findById(creator);
+      if (!creatorUser) {
+        socket.emit("error", "Không tìm thấy người tạo nhóm");
+        return;
+      }
+
+      // Kiểm tra các thành viên có tồn tại không
+      const memberUsers = await UserModel.find({ _id: { $in: members } });
+      if (memberUsers.length !== members.length) {
+        socket.emit("error", "Một số thành viên không tồn tại");
+        return;
+      }
+
+      // Tạo nhóm mới
+      const newGroup = new GroupChatModel({
+        name,
+        creator,
+        members: [...members, creator], // Thêm người tạo vào danh sách thành viên
+        isGroup: true
+      });
+
+      await newGroup.save();
+
+      // Populate thông tin chi tiết của group
+      const populatedGroup = await GroupChatModel.findById(newGroup._id)
+        .populate("members", "name profile_pic")
+        .populate("creator", "name profile_pic");
+
+      // Thông báo cho tất cả thành viên về nhóm mới
+      const allMembers = [...members, creator];
+      allMembers.forEach(memberId => {
+        if (onlineUser.has(memberId.toString())) {
+          io.to(memberId.toString()).emit("new-group", populatedGroup);
+        }
+      });
+
+      // Thông báo thành công cho người tạo
+      socket.emit("group-created", {
+        success: true,
+        group: populatedGroup
+      });
+
+    } catch (error) {
+      console.error("Error creating group:", error);
+      socket.emit("error", "Có lỗi xảy ra khi tạo nhóm");
+    }
+  });
+
+  // Handle send group message
+  socket.on("group-message", async (data) => {
+    try {
+      const { groupId, text, sender } = data;
+
+      // Validate input
+      if (!groupId || !sender) {
+        socket.emit("error", "Thiếu thông tin cần thiết");
+        return;
+      }
+
+      // Kiểm tra group có tồn tại không
+      const group = await GroupChatModel.findById(groupId);
+      if (!group) {
+        socket.emit("error", "Không tìm thấy nhóm");
+        return;
+      }
+
+      // Kiểm tra người gửi có trong nhóm không
+      if (!group.members.includes(sender)) {
+        socket.emit("error", "Bạn không phải thành viên của nhóm");
+        return;
+      }
+
+      // Tạo tin nhắn mới
+      const newMessage = new MessageModel({
+        sender,
+        text,
+        groupId,
+        isGroupMessage: true
+      });
+
+      await newMessage.save();
+
+      // Cập nhật tin nhắn cuối cùng của nhóm
+      group.lastMessage = newMessage._id;
+      await group.save();
+
+      // Populate thông tin chi tiết của tin nhắn
+      const populatedMessage = await MessageModel.findById(newMessage._id)
+        .populate("sender", "name profile_pic");
+
+      // Gửi tin nhắn đến tất cả thành viên trong nhóm
+      group.members.forEach(memberId => {
+        if (onlineUser.has(memberId.toString())) {
+          io.to(memberId.toString()).emit("new-group-message", {
+            groupId,
+            message: populatedMessage
+          });
+        }
+      });
+
+    } catch (error) {
+      console.error("Error sending group message:", error);
+      socket.emit("error", "Có lỗi xảy ra khi gửi tin nhắn");
     }
   });
 });
