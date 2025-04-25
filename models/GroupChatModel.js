@@ -31,6 +31,24 @@ const groupChatSchema = new mongoose.Schema(
     isGroup: {
       type: Boolean,
       default: true
+    },
+    unseenMessages: [{
+      userId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User"
+      },
+      count: {
+        type: Number,
+        default: 0
+      },
+      lastSeenMessage: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Message"
+      }
+    }],
+    createdAt: {
+      type: Date,
+      default: Date.now
     }
   },
   {
