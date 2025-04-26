@@ -712,10 +712,10 @@ io.on("connection", async (socket) => {
   });
 
   // Handle message reactions
-  socket.on("react_to_message", async (reactionData) => {
+  socket.on("react_to_message", async (data) => {
     try {
-      const { messageId, emoji, userId } = reactionData;
-      console.log("Handling reaction:", { messageId, emoji, userId });
+      const { messageId, emoji, userId, isGroupChat, groupId, conversationId } = data;
+      console.log("Handling reaction:", { messageId, emoji, userId, isGroupChat, groupId });
       
       // Validate input
       if (!messageId || !emoji || !userId) {
@@ -732,12 +732,6 @@ io.on("connection", async (socket) => {
         return;
       }
 
-      console.log("Found message:", {
-        id: message._id,
-        groupId: message.groupId,
-        currentReactions: message.reactions || []
-      });
-
       // Initialize reactions array if it doesn't exist
       if (!message.reactions) {
         message.reactions = [];
@@ -750,7 +744,13 @@ io.on("connection", async (socket) => {
 
       if (existingReactionIndex > -1) {
         // Nếu đã có reaction thì cập nhật emoji
-        message.reactions[existingReactionIndex].emoji = emoji;
+        if (message.reactions[existingReactionIndex].emoji === emoji) {
+          // Nếu emoji giống nhau, xóa reaction
+          message.reactions.splice(existingReactionIndex, 1);
+        } else {
+          // Nếu emoji khác, cập nhật emoji mới
+          message.reactions[existingReactionIndex].emoji = emoji;
+        }
       } else {
         // Thêm reaction mới
         message.reactions.push({
@@ -760,86 +760,150 @@ io.on("connection", async (socket) => {
       }
 
       // Lưu tin nhắn đã cập nhật
-      message = await message.save();
-      
-      // Lấy tin nhắn đã cập nhật với đầy đủ thông tin
-      message = await MessageModel.findById(message._id)
-        .populate("msgByUserId", "name profile_pic")
-        .populate({
-          path: "replyTo",
-          populate: {
-            path: "msgByUserId",
-            select: "name profile_pic"
-          }
-        });
-
-      // Lấy thông tin người dùng reaction
-      const reactingUser = await UserModel.findById(userId).select("name profile_pic");
+      await message.save();
 
       // Chuẩn bị dữ liệu reaction để gửi về client
       const reactionUpdate = {
         messageId: message._id.toString(),
         reactions: message.reactions,
-        user: {
-          _id: reactingUser._id,
-          name: reactingUser.name,
-          profile_pic: reactingUser.profile_pic
-        }
+        groupId: isGroupChat ? groupId : null // Thêm groupId nếu là group chat
       };
 
-      console.log("Sending reaction update:", reactionUpdate);
-
-      if (message.groupId) {
-        console.log("Processing group message reaction");
+      if (isGroupChat) {
         // Nếu là tin nhắn nhóm
-        const group = await GroupChatModel.findById(message.groupId);
+        const group = await GroupChatModel.findById(groupId)
+          .populate("members", "name profile_pic");
+          
         if (!group) {
-          console.error("Group not found:", message.groupId);
+          console.error("Group not found:", groupId);
           return;
         }
 
-        // Lấy tất cả tin nhắn của nhóm với thông tin đầy đủ
-        const groupMessages = await MessageModel.find({
-          _id: { $in: group.messages }
-        })
-        .populate("msgByUserId", "name profile_pic")
-        .populate({
-          path: "replyTo",
-          populate: {
-            path: "msgByUserId",
-            select: "name profile_pic"
-          }
-        })
-        .sort({ createdAt: 1 });
-
-        console.log(`Sending updates to ${group.members.length} group members`);
-        
         // Gửi cập nhật cho tất cả thành viên trong nhóm
-        for (const memberId of group.members) {
-          if (onlineUser.has(memberId.toString())) {
-            // Gửi cập nhật reaction trước
-            io.to(memberId.toString()).emit("reaction-updated", reactionUpdate);
-            
-            // Sau đó gửi cập nhật toàn bộ tin nhắn
-            setTimeout(() => {
-              io.to(memberId.toString()).emit("group-messages", groupMessages);
-            }, 100);
+        group.members.forEach(member => {
+          if (onlineUser.has(member._id.toString())) {
+            io.to(member._id.toString()).emit("group-reaction-updated", reactionUpdate);
           }
-        }
+        });
+
+        // Cập nhật lại tin nhắn trong group
+        const updatedMessage = await MessageModel.findById(messageId)
+          .populate("msgByUserId", "name profile_pic")
+          .populate({
+            path: "replyTo",
+            populate: {
+              path: "msgByUserId",
+              select: "name profile_pic"
+            }
+          });
+
+        // Gửi tin nhắn đã cập nhật cho tất cả thành viên
+        group.members.forEach(member => {
+          if (onlineUser.has(member._id.toString())) {
+            io.to(member._id.toString()).emit("update-group-message", {
+              ...updatedMessage.toObject(),
+              groupId
+            });
+          }
+        });
       } else {
         // Nếu là tin nhắn cá nhân
-        const conversation = await ConversationModel.findOne({
-          messages: messageId
-        });
+        const conversation = await ConversationModel.findById(conversationId);
         if (conversation) {
           io.to(conversation.sender.toString()).emit("reaction-updated", reactionUpdate);
           io.to(conversation.receiver.toString()).emit("reaction-updated", reactionUpdate);
         }
       }
 
+      // Gửi phản hồi thành công cho người thực hiện reaction
+      socket.emit("reaction-success", reactionUpdate);
+
     } catch (error) {
       console.error("Lỗi khi xử lý reaction:", error);
       socket.emit("error", "Không thể thêm reaction");
+    }
+  });
+
+  // Handle reaction removal for private chats
+  socket.on("remove-reaction", async (removeData) => {
+    try {
+      const { messageId: msgId, userId: uid, conversationId: convId } = removeData;
+      
+      // Validate input
+      if (!msgId || !uid) {
+        socket.emit("error", "Thiếu thông tin để xóa reaction");
+        return;
+      }
+
+      // Tìm và cập nhật tin nhắn
+      let message = await MessageModel.findById(msgId);
+      if (!message) {
+        socket.emit("error", "Không tìm thấy tin nhắn");
+        return;
+      }
+
+      // Xóa reaction của user
+      message.reactions = message.reactions.filter(r => r.userId.toString() !== uid.toString());
+      await message.save();
+
+      // Chuẩn bị dữ liệu để gửi về client
+      const reactionUpdate = {
+        messageId: message._id.toString(),
+        reactions: message.reactions
+      };
+
+      // Gửi cập nhật cho các user trong cuộc trò chuyện
+      const conversation = await ConversationModel.findById(convId);
+      if (conversation) {
+        io.to(conversation.sender.toString()).emit("reaction-updated", reactionUpdate);
+        io.to(conversation.receiver.toString()).emit("reaction-updated", reactionUpdate);
+      }
+    } catch (error) {
+      console.error("Lỗi khi xóa reaction:", error);
+      socket.emit("error", "Không thể xóa reaction");
+    }
+  });
+
+  // Handle reaction removal for group chats
+  socket.on("remove-group-reaction", async (groupData) => {
+    try {
+      const { messageId: msgId, userId: uid, groupId: gid } = groupData;
+      
+      // Validate input
+      if (!msgId || !uid || !gid) {
+        socket.emit("error", "Thiếu thông tin để xóa reaction");
+        return;
+      }
+
+      // Tìm và cập nhật tin nhắn
+      let message = await MessageModel.findById(msgId);
+      if (!message) {
+        socket.emit("error", "Không tìm thấy tin nhắn");
+        return;
+      }
+
+      // Xóa reaction của user
+      message.reactions = message.reactions.filter(r => r.userId.toString() !== uid.toString());
+      await message.save();
+
+      // Chuẩn bị dữ liệu để gửi về client
+      const reactionUpdate = {
+        messageId: message._id.toString(),
+        reactions: message.reactions
+      };
+
+      // Gửi cập nhật cho tất cả thành viên trong nhóm
+      const group = await GroupChatModel.findById(gid);
+      if (group) {
+        group.members.forEach(memberId => {
+          if (onlineUser.has(memberId.toString())) {
+            io.to(memberId.toString()).emit("reaction-updated", reactionUpdate);
+          }
+        });
+      }
+    } catch (error) {
+      console.error("Lỗi khi xóa reaction trong nhóm:", error);
+      socket.emit("error", "Không thể xóa reaction");
     }
   });
 
@@ -1111,7 +1175,7 @@ io.on("connection", async (socket) => {
   // Handle recall message
   socket.on("recall-message", async (data) => {
     try {
-      const { messageId, userId, conversationId } = data;
+      const { messageId, userId, conversationId, isGroup, groupId } = data;
       const message = await MessageModel.findById(messageId);
       
       if (!message) {
@@ -1125,62 +1189,132 @@ io.on("connection", async (socket) => {
         return;
       }
 
-      // Kiểm tra người dùng có trong cuộc trò chuyện không
-      const conversation = await ConversationModel.findById(conversationId);
-      if (!conversation) {
-        socket.emit("recall-message-error", { error: "Conversation not found" });
-        return;
-      }
+      if (isGroup) {
+        // Xử lý thu hồi tin nhắn trong nhóm
+        const group = await GroupChatModel.findById(groupId);
+        if (!group) {
+          socket.emit("recall-message-error", { error: "Group not found" });
+          return;
+        }
 
-      // Kiểm tra người dùng có trong cuộc trò chuyện
-      const isUserInConversation = conversation.sender.toString() === userId.toString() || 
-                                  conversation.receiver.toString() === userId.toString();
-      
-      if (!isUserInConversation) {
-        socket.emit("recall-message-error", { error: "User not in conversation" });
-        return;
-      }
+        // Kiểm tra người dùng có trong nhóm không
+        if (!group.members.includes(userId)) {
+          socket.emit("recall-message-error", { error: "You are not a member of this group" });
+          return;
+        }
 
-      // Đánh dấu tin nhắn đã thu hồi
-      message.isRecalled = true;
-      await message.save();
+        // Đánh dấu tin nhắn đã thu hồi
+        message.isRecalled = true;
+        await message.save();
 
-      // Gửi thông báo thu hồi tin nhắn thành công cho cả hai người dùng
-      io.to(conversation.sender.toString()).emit("recall-message-success", { messageId });
-      io.to(conversation.receiver.toString()).emit("recall-message-success", { messageId });
-
-      // Lấy danh sách tin nhắn đã cập nhật cho cả hai người dùng
-      const updatedConversation = await ConversationModel.findById(conversationId)
+        // Lấy danh sách tin nhắn đã cập nhật
+        const updatedMessages = await MessageModel.find({
+          _id: { $in: group.messages }
+        })
+        .populate("msgByUserId", "name profile_pic")
         .populate({
-          path: 'messages',
-          populate: [
-            {
-              path: "msgByUserId",
-              select: "name profile_pic"
-            },
-            {
-              path: "replyTo",
-              populate: {
+          path: "replyTo",
+          populate: {
+            path: "msgByUserId",
+            select: "name profile_pic"
+          }
+        })
+        .sort({ createdAt: 1 });
+
+        // Gửi thông báo thu hồi tin nhắn cho tất cả thành viên trong nhóm
+        group.members.forEach((memberId) => {
+          if (onlineUser.has(memberId.toString())) {
+            // Gửi sự kiện thu hồi tin nhắn
+            io.to(memberId.toString()).emit("recall-message-success", { 
+              messageId,
+              groupId
+            });
+
+            // Gửi lại danh sách tin nhắn đã cập nhật
+            io.to(memberId.toString()).emit("group-messages", updatedMessages);
+          }
+        });
+
+        // Cập nhật lastMessage nếu tin nhắn bị thu hồi là tin nhắn cuối cùng
+        if (group.lastMessage.toString() === messageId) {
+          // Tìm tin nhắn cuối cùng không bị thu hồi
+          const lastValidMessage = await MessageModel.findOne({
+            _id: { $in: group.messages },
+            isRecalled: { $ne: true }
+          })
+          .sort({ createdAt: -1 });
+
+          if (lastValidMessage) {
+            group.lastMessage = lastValidMessage._id;
+          }
+          await group.save();
+
+          // Cập nhật danh sách nhóm cho tất cả thành viên
+          for (const memberId of group.members) {
+            if (onlineUser.has(memberId.toString())) {
+              const userGroups = await GroupChatModel.find({
+                members: memberId
+              })
+              .populate("members", "name profile_pic")
+              .populate("creator", "name profile_pic")
+              .populate("lastMessage");
+
+              io.to(memberId.toString()).emit("user-groups", userGroups);
+            }
+          }
+        }
+      } else {
+        // Xử lý thu hồi tin nhắn trong chat đơn (giữ nguyên code cũ)
+        const conversation = await ConversationModel.findById(conversationId);
+        if (!conversation) {
+          socket.emit("recall-message-error", { error: "Conversation not found" });
+          return;
+        }
+
+        const isUserInConversation = conversation.sender.toString() === userId.toString() || 
+                                   conversation.receiver.toString() === userId.toString();
+        
+        if (!isUserInConversation) {
+          socket.emit("recall-message-error", { error: "User not in conversation" });
+          return;
+        }
+
+        message.isRecalled = true;
+        await message.save();
+
+        io.to(conversation.sender.toString()).emit("recall-message-success", { messageId });
+        io.to(conversation.receiver.toString()).emit("recall-message-success", { messageId });
+
+        const updatedConversation = await ConversationModel.findById(conversationId)
+          .populate({
+            path: 'messages',
+            populate: [
+              {
                 path: "msgByUserId",
                 select: "name profile_pic"
+              },
+              {
+                path: "replyTo",
+                populate: {
+                  path: "msgByUserId",
+                  select: "name profile_pic"
+                }
               }
-            }
-          ],
-          options: { sort: { createdAt: 1 } }
+            ],
+            options: { sort: { createdAt: 1 } }
+          });
+
+        const processedMessages = updatedConversation.messages.map(msg => {
+          const messageObj = msg.toObject();
+          if (messageObj._id.toString() === messageId) {
+            messageObj.isRecalled = true;
+          }
+          return messageObj;
         });
 
-      // Đảm bảo trạng thái isRecalled được giữ nguyên
-      const processedMessages = updatedConversation.messages.map(msg => {
-        const messageObj = msg.toObject();
-        if (messageObj._id.toString() === messageId) {
-          messageObj.isRecalled = true;
-        }
-        return messageObj;
-        });
-
-      // Gửi tin nhắn cập nhật cho cả hai người dùng
-      io.to(conversation.sender.toString()).emit("message", processedMessages || []);
-      io.to(conversation.receiver.toString()).emit("message", processedMessages || []);
+        io.to(conversation.sender.toString()).emit("message", processedMessages || []);
+        io.to(conversation.receiver.toString()).emit("message", processedMessages || []);
+      }
 
     } catch (error) {
       console.error("Error recalling message:", error);
@@ -1251,7 +1385,7 @@ io.on("connection", async (socket) => {
   // Handle get group messages
   socket.on("get-group-messages", async (groupId) => {
     try {
-      console.log("Getting messages for group:", groupId); // Debug log
+      console.log("Getting messages for group:", groupId);
 
       // Kiểm tra group có tồn tại không
       const group = await GroupChatModel.findById(groupId)
@@ -1284,6 +1418,42 @@ io.on("connection", async (socket) => {
         return;
       }
 
+      // Reset số tin nhắn chưa đọc cho người dùng khi mở chat
+      const memberUnseenIndex = group.unseenMessages.findIndex(
+        um => um.userId.toString() === user._id.toString()
+      );
+
+      if (memberUnseenIndex !== -1) {
+        // Đặt lại số tin nhắn chưa đọc về 0
+        group.unseenMessages[memberUnseenIndex].count = 0;
+        group.unseenMessages[memberUnseenIndex].lastSeenMessage = group.messages[group.messages.length - 1];
+        await group.save();
+
+        // Lấy tất cả nhóm của người dùng và cập nhật UI
+        const userGroups = await GroupChatModel.find({
+          members: user._id
+        })
+        .populate("members", "name profile_pic")
+        .populate("creator", "name profile_pic")
+        .populate("lastMessage");
+
+        // Sắp xếp nhóm theo thời gian tin nhắn cuối cùng
+        const sortedGroups = userGroups.sort((a, b) => {
+          const aTime = a.lastMessage?.createdAt || a.createdAt;
+          const bTime = b.lastMessage?.createdAt || b.createdAt;
+          return new Date(bTime) - new Date(aTime);
+        });
+
+        // Gửi hai sự kiện để đảm bảo cả sidebar và danh sách nhóm được cập nhật
+        io.to(user._id.toString()).emit("user-groups", sortedGroups);
+        
+        // Gửi sự kiện cập nhật trạng thái đã xem
+        io.to(user._id.toString()).emit("group-messages-seen", {
+          groupId: groupId,
+          userId: user._id.toString()
+        });
+      }
+
       console.log("Found messages for group:", {
         groupId,
         count: group.messages?.length || 0,
@@ -1292,9 +1462,16 @@ io.on("connection", async (socket) => {
           text: group.messages[0].text,
           sender: group.messages[0].msgByUserId?.name
         } : null
-      }); // Debug log
+      });
 
       socket.emit("group-messages", group.messages || []);
+
+      // Emit seen-group-message event to update the UI immediately
+      socket.emit("seen-group-message-success", {
+        groupId: groupId,
+        userId: user._id.toString()
+      });
+
     } catch (error) {
       console.error("Error getting group messages:", error);
       socket.emit("error", "Có lỗi xảy ra khi lấy tin nhắn nhóm");
@@ -1362,18 +1539,35 @@ io.on("connection", async (socket) => {
       // Cập nhật số tin nhắn chưa đọc cho các thành viên khác
       group.members.forEach(memberId => {
         if (memberId.toString() !== sender.toString()) {
-          const memberUnseenIndex = group.unseenMessages.findIndex(
-            um => um.userId.toString() === memberId.toString()
-          );
-
-          if (memberUnseenIndex !== -1) {
-            group.unseenMessages[memberUnseenIndex].count += 1;
-          } else {
-            group.unseenMessages.push({
-              userId: memberId,
-              count: 1,
-              lastSeenMessage: group.messages[group.messages.length - 2] // tin nhắn trước tin nhắn mới
+          // Chỉ tăng số tin nhắn chưa đọc cho những người không đang xem chat
+          const memberSocket = Array.from(io.sockets.sockets.values())
+            .find(s => {
+              try {
+                if (!s.handshake?.auth?.token) return false;
+                const socketUser = getUserDetailFromToken(s.handshake.auth.token);
+                return socketUser && socketUser._id.toString() === memberId.toString();
+              } catch (error) {
+                console.error("Error checking socket user:", error);
+                return false;
+              }
             });
+          
+          const isViewingChat = memberSocket?.viewingChat === groupId;
+          
+          if (!isViewingChat) {
+            const memberUnseenIndex = group.unseenMessages.findIndex(
+              um => um.userId.toString() === memberId.toString()
+            );
+
+            if (memberUnseenIndex !== -1) {
+              group.unseenMessages[memberUnseenIndex].count += 1;
+            } else {
+              group.unseenMessages.push({
+                userId: memberId,
+                count: 1,
+                lastSeenMessage: group.messages[group.messages.length - 2] // tin nhắn trước tin nhắn mới
+              });
+            }
           }
         }
       });
@@ -1425,6 +1619,51 @@ io.on("connection", async (socket) => {
       console.error("Error sending group message:", error);
       socket.emit("error", "Có lỗi xảy ra khi gửi tin nhắn");
     }
+  });
+
+  // Thêm event handler để theo dõi chat đang mở
+  socket.on("viewing-chat", async (data) => {
+    try {
+      const { chatId, isGroup } = data;
+      socket.viewingChat = chatId;
+
+      if (isGroup) {
+        // Reset số tin nhắn chưa đọc khi mở chat nhóm
+        await GroupChatModel.updateOne(
+          { 
+            _id: chatId,
+            "unseenMessages.userId": user._id 
+          },
+          { 
+            $set: { 
+              "unseenMessages.$.count": 0 
+            } 
+          }
+        );
+
+        // Cập nhật lại danh sách nhóm
+        const userGroups = await GroupChatModel.find({
+          members: user._id
+        })
+        .populate("members", "name profile_pic")
+        .populate("creator", "name profile_pic")
+        .populate("lastMessage");
+
+        const sortedGroups = userGroups.sort((a, b) => {
+          const aTime = a.lastMessage?.createdAt || a.createdAt;
+          const bTime = b.lastMessage?.createdAt || b.createdAt;
+          return new Date(bTime) - new Date(aTime);
+        });
+
+        io.to(user._id.toString()).emit("user-groups", sortedGroups);
+      }
+    } catch (error) {
+      console.error("Error updating viewing chat status:", error);
+    }
+  });
+
+  socket.on("leave-chat", () => {
+    socket.viewingChat = null;
   });
 
   // Handle seen group message
@@ -1589,7 +1828,10 @@ io.on("connection", async (socket) => {
       const { groupId, userId } = data;
       
       // Kiểm tra nhóm tồn tại
-      const group = await GroupChatModel.findById(groupId);
+      const group = await GroupChatModel.findById(groupId)
+        .populate("members", "name profile_pic")
+        .populate("creator", "name profile_pic");
+
       if (!group) {
         socket.emit("leave-group-error", {
           message: "Không tìm thấy nhóm"
@@ -1598,7 +1840,7 @@ io.on("connection", async (socket) => {
       }
 
       // Kiểm tra người dùng có trong nhóm không
-      if (!group.members.includes(userId)) {
+      if (!group.members.some(member => member._id.toString() === userId)) {
         socket.emit("leave-group-error", {
           message: "Bạn không phải thành viên của nhóm"
         });
@@ -1606,12 +1848,15 @@ io.on("connection", async (socket) => {
       }
 
       // Không cho phép người tạo nhóm rời nhóm
-      if (group.creator.toString() === userId) {
+      if (group.creator._id.toString() === userId) {
         socket.emit("leave-group-error", {
           message: "Người tạo nhóm không thể rời nhóm. Bạn có thể xóa nhóm nếu muốn."
         });
         return;
       }
+
+      // Lấy thông tin người rời nhóm
+      const leavingUser = await UserModel.findById(userId);
 
       // Xóa người dùng khỏi danh sách thành viên
       await GroupChatModel.findByIdAndUpdate(groupId, {
@@ -1621,9 +1866,9 @@ io.on("connection", async (socket) => {
         }
       });
 
-      // Thêm tin nhắn thông báo vào nhóm
+      // Tạo tin nhắn hệ thống
       const systemMessage = new MessageModel({
-        text: `${user.name} đã rời khỏi nhóm`,
+        text: `${leavingUser.name} đã rời khỏi nhóm`,
         msgByUserId: userId,
         groupId: groupId,
         isGroupMessage: true,
@@ -1647,7 +1892,9 @@ io.on("connection", async (socket) => {
 
       // Thông báo cho người rời nhóm
       socket.emit("leave-group-success", {
-        groupId: groupId
+        groupId: groupId,
+        systemMessage: savedMessage,
+        userId: userId
       });
 
       // Thông báo cho các thành viên còn lại
@@ -1658,8 +1905,8 @@ io.on("connection", async (socket) => {
             ...savedMessage.toObject(),
             msgByUserId: {
               _id: userId,
-              name: user.name,
-              profile_pic: user.profile_pic
+              name: leavingUser.name,
+              profile_pic: leavingUser.profile_pic
             }
           });
 
@@ -1689,7 +1936,7 @@ io.on("connection", async (socket) => {
   // Handle add members to group
   socket.on("add-members-to-group", async (data) => {
     try {
-      const { groupId, newMembers, addedBy } = data;
+      const { groupId, newMembers, addedBy, groupName, currentMembers } = data;
       
       // Kiểm tra nhóm tồn tại
       const group = await GroupChatModel.findById(groupId)
@@ -1774,15 +2021,19 @@ io.on("connection", async (socket) => {
 
       // Thông báo cho người thêm thành viên
       socket.emit("add-members-success", {
-        group: updatedGroup,
+        groupId: groupId,
+        systemMessage: savedMessage,
         addedMembers: addedUsers
       });
 
       // Thông báo cho tất cả thành viên trong nhóm (cả cũ và mới)
-      updatedGroup.members.forEach((member) => {
-        if (onlineUser.has(member._id.toString())) {
+      const allMembers = [...group.members.map(m => m._id.toString()), ...validNewMembers];
+      
+      // Gửi thông báo cho từng thành viên
+      for (const memberId of allMembers) {
+        if (onlineUser.has(memberId)) {
           // Gửi tin nhắn hệ thống
-          io.to(member._id.toString()).emit("group-message", {
+          io.to(memberId).emit("group-message", {
             ...savedMessage.toObject(),
             msgByUserId: {
               _id: addedBy,
@@ -1792,7 +2043,7 @@ io.on("connection", async (socket) => {
           });
 
           // Cập nhật thông tin nhóm
-          io.to(member._id.toString()).emit("group-info", {
+          io.to(memberId).emit("group-info", {
             _id: updatedGroup._id,
             name: updatedGroup.name,
             avatar: updatedGroup.avatar || "",
@@ -1802,9 +2053,24 @@ io.on("connection", async (socket) => {
           });
 
           // Cập nhật danh sách nhóm
-          io.to(member._id.toString()).emit("get-user-groups");
+          const memberGroups = await GroupChatModel.find({
+            members: memberId
+          })
+          .populate("members", "name profile_pic")
+          .populate("creator", "name profile_pic")
+          .populate("lastMessage");
+
+          io.to(memberId).emit("user-groups", memberGroups);
+          io.to(memberId).emit("get-user-groups");
         }
-      });
+      }
+
+      // Gửi thông báo cho những người được thêm
+      for (const newMemberId of validNewMembers) {
+        if (onlineUser.has(newMemberId)) {
+          io.to(newMemberId).emit("new-group", updatedGroup);
+        }
+      }
 
     } catch (error) {
       console.error("Error adding members to group:", error);
@@ -1939,15 +2205,8 @@ io.on("connection", async (socket) => {
             isGroup: true
           });
 
-          // Cập nhật lại danh sách nhóm cho từng thành viên
-          const memberGroups = await GroupChatModel.find({
-            members: member._id
-          })
-          .populate("members", "name profile_pic")
-          .populate("creator", "name profile_pic")
-          .populate("lastMessage");
-
-          io.to(member._id.toString()).emit("user-groups", memberGroups);
+          // Cập nhật danh sách nhóm
+          io.to(member._id.toString()).emit("get-user-groups");
         }
       });
 
