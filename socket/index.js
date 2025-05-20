@@ -6,6 +6,7 @@ const UserModel = require("../models/UserModel");
 const getConversation = require("../helpers/getConversation");
 const FriendRequestModel = require("../models/FriendRequestModel");
 const GroupChatModel = require("../models/GroupChatModel");
+const GroupChat = require("../models/GroupChatModel");
 
 const {
   ConversationModel,
@@ -2083,7 +2084,7 @@ io.on("connection", async (socket) => {
           !group.members.some((member) => member._id.toString() === addedBy)
         ) {
           socket.emit("add-members-error", {
-            message: "Bạn không có quyền thêm thành viên vào nhóm này",
+            message: "Bạn không phải thành viên của nhóm này",
           });
           return;
         }
@@ -2351,6 +2352,38 @@ io.on("connection", async (socket) => {
         socket.emit("kick-member-error", {
           message: "Có lỗi xảy ra khi xóa thành viên khỏi nhóm",
         });
+      }
+    });
+
+    socket.on("transfer-group-ownership", async (data) => {
+      try {
+        const { groupId, currentOwnerId, newOwnerId } = data;
+        const group = await GroupChat.findById(groupId);
+
+        if (!group) {
+          socket.emit("transfer-ownership-error", { message: "Nhóm không tồn tại" });
+          return;
+        }
+
+        if (group.creator.toString() !== currentOwnerId) {
+          socket.emit("transfer-ownership-error", { message: "Bạn không phải trưởng nhóm" });
+          return;
+        }
+
+        if (!group.members.includes(newOwnerId)) {
+          socket.emit("transfer-ownership-error", { message: "Người nhận không thuộc nhóm" });
+          return;
+        }
+
+        group.creator = newOwnerId;
+        await group.save();
+
+        socket.emit("transfer-ownership-success", { message: "Chuyển quyền trưởng nhóm thành công" });
+        // Gửi thông báo cho các thành viên khác nếu muốn
+        socket.to(groupId).emit("group-ownership-changed", { groupId, newOwnerId });
+
+      } catch (err) {
+        socket.emit("transfer-ownership-error", { message: "Có lỗi xảy ra khi chuyển quyền" });
       }
     });
   } catch (error) {
